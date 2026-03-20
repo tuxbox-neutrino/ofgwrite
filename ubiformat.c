@@ -266,7 +266,7 @@ static void print_bad_eraseblocks(const struct mtd_dev_info *mtd,
 		return;
 
 	normsg_cont("%d bad eraseblocks found, numbers: ", si->bad_cnt);
-	char info[30];
+	char info[128];
 	sprintf(info, "Bad blocks: %d (uncritical, when no changes)", si->bad_cnt);
 	set_info_text(info);
 	for (eb = 0; eb < mtd->eb_cnt; eb++) {
