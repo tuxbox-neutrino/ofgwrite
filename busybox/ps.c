@@ -799,8 +799,9 @@ int ps_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 		}
 
 		{
-			// changed for ofgwrite
-			if (strcmp(p->comm, "enigma2") == 0)
+			// changed for ofgwrite: detect GUI process (Enigma2 or Neutrino)
+			if (strcmp(p->comm, "enigma2") == 0
+			 || strcmp(p->comm, "neutrino") == 0)
 				return 9999;
 			int sz = terminal_width - len;
 			if (sz >= 0) {

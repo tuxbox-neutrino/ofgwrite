@@ -27,6 +27,11 @@ extern char nfi_path[1000];
 
 void handle_busybox_fatal_error();
 
+enum InitSystemEnum
+{
+	INIT_SYSVINIT, INIT_SYSTEMD
+};
+
 enum RootfsTypeEnum
 {
 	UNKNOWN, UBIFS, JFFS2, EXT4, EXT3

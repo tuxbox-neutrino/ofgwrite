@@ -19,6 +19,7 @@
 #include "busybox/include/libbb.h"
 
 #define SHA_DIGEST_LENGTH 20
+#define OFG_MKDIR_MODE 0777
 
 typedef struct {
     // ... (other header fields)
@@ -109,7 +110,7 @@ enum RootfsTypeEnum rootfs_type;
 int stop_e2_needed = 1;
 int chkroot_mode = 0;
 
-const char ofgwrite_version[] = "4.8.0.1";
+const char ofgwrite_version[] = "4.8.0.2";
 
 struct struct_mountlist
 {
@@ -119,6 +120,14 @@ struct struct_mountlist
 
 
 static unsigned char padding[16384] = { 0, };
+
+static void set_root_mount_private(void)
+{
+	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+	{
+		my_printf("Warning: failed to set root mount propagation private: %s\n", strerror(errno));
+	}
+}
 
 static void print_id(const uint8_t *id, size_t id_len) {
     my_printf("0x");
@@ -1016,6 +1025,34 @@ int readProcMounts()
 	return 1;
 }
 
+enum InitSystemEnum detect_init_system()
+{
+	FILE *f = fopen("/proc/1/comm", "r");
+	if (f)
+	{
+		char buf[64] = {0};
+		if (fgets(buf, sizeof(buf), f))
+		{
+			fclose(f);
+			/* strip trailing newline */
+			char *nl = strchr(buf, '\n');
+			if (nl)
+				*nl = '\0';
+			if (strcmp(buf, "systemd") == 0)
+			{
+				my_printf("Detected init system: systemd\n");
+				return INIT_SYSTEMD;
+			}
+		}
+		else
+		{
+			fclose(f);
+		}
+	}
+	my_printf("Detected init system: sysvinit (default)\n");
+	return INIT_SYSVINIT;
+}
+
 int exec_ps()
 {
 	// call ps
@@ -1042,7 +1079,7 @@ int check_e2_stopped()
 
 	set_step_progress(0);
 	if (!quiet)
-		my_printf("Checking E2 is running...\n");
+		my_printf("Checking GUI process is running...\n");
 	while (time < max_time && e2_found)
 	{
 		e2_found = exec_ps();
@@ -1050,14 +1087,14 @@ int check_e2_stopped()
 		if (!e2_found)
 		{
 			if (!quiet)
-				my_printf("E2 is stopped\n");
+				my_printf("GUI process is stopped\n");
 		}
 		else
 		{
 			sleep(2);
 			time += 2;
 			if (!quiet)
-				my_printf("E2 still running\n");
+				my_printf("GUI process still running\n");
 		}
 		set_step_progress(time * 100 / max_time);
 	}
@@ -1140,37 +1177,39 @@ int umount_rootfs(int steps)
 
 	int ret = 0;
 	my_printf("start umount_rootfs\n");
+	set_root_mount_private();
+
 	// the start script creates /newroot dir and mount tmpfs on it
 	// create directories
 	ret += chdir("/newroot");
-	ret += mkdir("/newroot/bin", 777);
-	ret += mkdir("/newroot/dev", 777);
-	ret += mkdir("/newroot/etc", 777);
-	ret += mkdir("/newroot/dev/pts", 777);
-	ret += mkdir("/newroot/lib", 777);
-	ret += mkdir("/newroot/media", 777);
-	ret += mkdir("/newroot/oldroot", 777);
-	ret += mkdir("/newroot/oldroot_remount", 777);
-	ret += mkdir("/newroot/proc", 777);
-	ret += mkdir("/newroot/run", 777);
-	ret += mkdir("/newroot/sbin", 777);
-	ret += mkdir("/newroot/sys", 777);
-	ret += mkdir("/newroot/usr", 777);
-	ret += mkdir("/newroot/usr/lib", 777);
-	ret += mkdir("/newroot/usr/lib/autofs", 777);
-	ret += mkdir("/newroot/usr/sbin", 777);
-	ret += mkdir("/newroot/var", 777);
-	ret += mkdir("/newroot/var/volatile", 777);
+	ret += mkdir("/newroot/bin", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/dev", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/etc", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/dev/pts", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/lib", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/media", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/oldroot", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/oldroot_remount", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/proc", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/run", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/sbin", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/sys", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/usr", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/usr/lib", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/usr/lib/autofs", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/usr/sbin", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/var", OFG_MKDIR_MODE);
+	ret += mkdir("/newroot/var/volatile", OFG_MKDIR_MODE);
 
 	if (multilib)
 	{
-		ret += mkdir("/newroot/lib64", 777);
-		ret += mkdir("/newroot/usr/lib64", 777);
-		ret += mkdir("/newroot/usr/lib64/autofs", 777);
+		ret += mkdir("/newroot/lib64", OFG_MKDIR_MODE);
+		ret += mkdir("/newroot/usr/lib64", OFG_MKDIR_MODE);
+		ret += mkdir("/newroot/usr/lib64/autofs", OFG_MKDIR_MODE);
 	}
 	if (android)
 	{
-		ret += mkdir("/newroot/dreamcard", 777);
+		ret += mkdir("/newroot/dreamcard", OFG_MKDIR_MODE);
 	}
 
 	// create maybe needed directory for image files mountpoint
@@ -1282,9 +1321,24 @@ int umount_rootfs(int steps)
 		ret += system("cp -arf /etc/resolv*      /newroot/etc");
 	}
 
-	// Switch to user mode 1
-	my_printf("Switching to user mode 2\n");
-	ret = system("init 2");
+	// Stop GUI and non-essential services to prepare for pivot_root.
+	// Detect init system to use the correct stop mechanism.
+	enum InitSystemEnum init_sys = detect_init_system();
+	if (init_sys == INIT_SYSTEMD)
+	{
+		my_printf("Stopping GUI service (systemd)\n");
+		// First, explicitly stop known GUI services synchronously.
+		// systemctl stop blocks until the service is actually stopped.
+		system("systemctl stop neutrino 2>/dev/null");
+		system("systemctl stop enigma2 2>/dev/null");
+		my_printf("Switching to rescue target (systemd)\n");
+		ret = system("systemctl isolate rescue.target");
+	}
+	else
+	{
+		my_printf("Switching to runlevel 2 (sysvinit)\n");
+		ret = system("init 2");
+	}
 	if (ret)
 	{
 		my_printf("Error switching runmode!\n");
@@ -1293,14 +1347,17 @@ int umount_rootfs(int steps)
 		return 0;
 	}
 
-	// it can take several seconds until E2 is shut down
+	// it can take several seconds until the GUI is shut down
 	// wait because otherwise remounting read only is not possible
-	set_step("Wait until E2 is stopped");
+	set_step("Wait until GUI is stopped");
 	if (!check_e2_stopped())
 	{
-		my_printf("Error E2 can't be stopped! Abort flashing.\n");
-		set_error_text("Error E2 can't be stopped! Abort flashing.");
-		ret = system("init 3");
+		my_printf("Error GUI can't be stopped! Abort flashing.\n");
+		set_error_text("Error GUI can't be stopped! Abort flashing.");
+		if (init_sys == INIT_SYSTEMD)
+			ret = system("systemctl isolate multi-user.target");
+		else
+			ret = system("init 3");
 		return 0;
 	}
 
@@ -1319,7 +1376,10 @@ int umount_rootfs(int steps)
 		my_printf("Error executing pivot_root!\n");
 		set_error_text("Error pivot_root! Abort flashing.");
 		sleep(5);
-		ret = system("init 3");
+		if (init_sys == INIT_SYSTEMD)
+			ret = system("systemctl isolate multi-user.target");
+		else
+			ret = system("init 3");
 		return 0;
 	}
 
@@ -1378,9 +1438,14 @@ int umount_rootfs(int steps)
 		my_printf("Error starting autofs\n");
 	}
 
-	// restart init process
-	ret = system("exec init u");
-	sleep(3);
+	// restart init process: only needed for sysvinit to re-exec from
+	// the new /sbin/init (busybox). Under systemd, daemon-reexec after
+	// pivot_root would fail because systemd binary is gone from newroot.
+	if (init_sys == INIT_SYSVINIT)
+	{
+		ret = system("exec init u");
+		sleep(3);
+	}
 
 	// kill all remaining open processes which prevent umounting rootfs
 	ret = exec_fuser_kill();
@@ -1864,6 +1929,10 @@ int main(int argc, char *argv[])
 			// kill VMC
 			ret = system("pkill -f vmc.sh");
 			ret = system("pkill -f DBServer.py");
+			// stop Neutrino-related services
+			ret = system("pkill -9 -f lcd4linux");
+			ret = system("pkill -9 -f camd");
+			ret = system("pkill -9 -f streamripper");
 			// stop autofs
 			ret = system("/etc/init.d/autofs stop");
 			// ignore return values, because the processes might not run
@@ -1896,7 +1965,7 @@ int main(int argc, char *argv[])
 		{
 			set_step("Mount rootfs");
 			my_printf("Mount rootfs\n");
-			mkdir("/oldroot_remount", 777);
+			mkdir("/oldroot_remount", OFG_MKDIR_MODE);
 			// mount rootfs device
 			if (rootfs_flash_mode == TARBZ2_MTD) // box with mtd subdir feature e.g. sfx6008
 				ret = mount(ubi_fs_name, "/oldroot_remount/", "ubifs", 0, NULL);
@@ -1994,7 +2063,7 @@ int main(int argc, char *argv[])
 			if (strcmp(device_root, "/dev/mmcblk1") == 0)
 			{
 				my_printf("Mount dreamcard\n");
-				mkdir(dreamcard_mount, 777);
+				mkdir(dreamcard_mount, OFG_MKDIR_MODE);
 
 				FILE *device = fopen("/dev/mmcblk1p1", "rb");
 				if (device == NULL) {
