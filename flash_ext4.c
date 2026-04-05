@@ -1,7 +1,38 @@
 #include "ofgwrite.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <getopt.h>
+#include <string.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
+static void log_extract_target_space(const char* filename, const char* directory)
+{
+	struct statvfs vfs;
+	struct stat archive;
+	unsigned long long free_bytes;
+
+	if (statvfs(directory, &vfs) != 0)
+	{
+		my_printf("Warning: statvfs failed for %s: %s\n", directory, strerror(errno));
+		return;
+	}
+
+	if (stat(filename, &archive) != 0)
+	{
+		my_printf("Warning: stat failed for %s: %s\n", filename, strerror(errno));
+		return;
+	}
+
+	free_bytes = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+	my_printf("Extract target free bytes: %llu, archive bytes: %lld\n",
+		free_bytes, (long long)archive.st_size);
+	if (free_bytes < (unsigned long long)archive.st_size)
+	{
+		my_printf("Warning: free bytes are below archive size, extraction is likely to fail\n");
+	}
+}
 
 int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int quiet, int no_write)
 {
@@ -106,9 +137,20 @@ int untar_rootfs(char* filename, char* directory, int quiet, int no_write)
 
 	if (!quiet)
 		my_printf("Untar: tar xf %s\n", filename);
+	if (access(directory, F_OK) != 0)
+	{
+		my_printf("Error: rootfs target directory missing: %s (%s)\n", directory, strerror(errno));
+		return 0;
+	}
+	log_extract_target_space(filename, directory);
 	if (!no_write)
+	{
 		if (tar_main(argc, argv) != 0)
+		{
+			my_printf("Error: tar extraction failed for %s into %s\n", filename, directory);
 			return 0;
+		}
+	}
 
 	return 1;
 }
@@ -134,7 +176,14 @@ int flash_unpack_rootfs(char* filename, int quiet, int no_write)
 	set_step("Extracting rootfs");
 	set_step_progress(0);
 	if (!no_write && current_rootfs_sub_dir[0] != '\0' && rootsubdir_check == 0) // box with rootSubDir feature
-		mkdir(path, 777); // directory is maybe not present
+	{
+		// Ensure target subdir exists before tar extraction.
+		if (mkdir(path, 0777) != 0 && errno != EEXIST)
+		{
+			my_printf("Error creating rootfs directory %s: %s\n", path, strerror(errno));
+			return 0;
+		}
+	}
 	if (!untar_rootfs(filename, path, quiet, no_write))
 	{
 		my_printf("Error extracting rootfs\n");
@@ -145,5 +194,9 @@ int flash_unpack_rootfs(char* filename, int quiet, int no_write)
 	sync();
 	sleep(1);
 	ret = chdir("/"); // needed to be able to umount filesystem
+	if (ret != 0)
+	{
+		my_printf("Warning: chdir(\"/\") failed: %s\n", strerror(errno));
+	}
 	return 1;
 }

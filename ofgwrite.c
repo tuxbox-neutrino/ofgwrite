@@ -98,6 +98,8 @@ int no_write      = 0;
 int force_e2_stop = 0;
 int quiet         = 0;
 int show_help     = 0;
+int pivot_only    = 0;
+int pivot_debug_fd = -1;
 int newroot_mounted = 0;
 char kernel_filename[1000];
 char rootfs_filename[1000];
@@ -110,7 +112,7 @@ enum RootfsTypeEnum rootfs_type;
 int stop_e2_needed = 1;
 int chkroot_mode = 0;
 
-const char ofgwrite_version[] = "4.8.0.3";
+const char ofgwrite_version[] = "4.8.0.4";
 
 struct struct_mountlist
 {
@@ -127,6 +129,113 @@ static void set_root_mount_private(void)
 	{
 		my_printf("Warning: failed to set root mount propagation private: %s\n", strerror(errno));
 	}
+}
+
+static int path_matches_component_prefix(const char *path, const char *prefix)
+{
+	size_t path_len = strlen(path);
+	size_t len = strlen(prefix);
+
+	if (path_len < len)
+		return 0;
+
+	return strncmp(path, prefix, len) == 0
+		&& (path[len] == '\0' || path[len] == '/');
+}
+
+static void log_mount_failure(FILE *kmsg, char *errbuf, size_t errbuf_size,
+	const char *label)
+{
+	snprintf(errbuf, errbuf_size, "%s: %s", label, strerror(errno));
+	my_printf("  FAIL %s\n", errbuf);
+	if (pivot_debug_fd >= 0)
+	{
+		dprintf(pivot_debug_fd, "FAIL %s\n", errbuf);
+		fsync(pivot_debug_fd);
+	}
+	if (kmsg)
+		fprintf(kmsg, "<3>ofgwrite: FAIL %s\n", errbuf);
+}
+
+static void pivot_debug_log(const char *format, ...)
+{
+	va_list ap;
+
+	if (pivot_debug_fd < 0)
+		return;
+
+	va_start(ap, format);
+	vdprintf(pivot_debug_fd, format, ap);
+	va_end(ap);
+	fsync(pivot_debug_fd);
+}
+
+static int setup_tmp_path(const char *image_mount_point, FILE *kmsg,
+	char *errbuf, size_t errbuf_size)
+{
+	struct stat st;
+	char link_target[256];
+	ssize_t link_len;
+
+	if (path_matches_component_prefix(image_mount_point, "/tmp"))
+	{
+		if (lstat("/tmp", &st) == 0)
+		{
+			if (S_ISDIR(st.st_mode))
+			{
+				my_printf("  keeping /tmp directory for image mountpoint %s\n",
+					image_mount_point);
+				pivot_debug_log("keep /tmp directory for image mountpoint %s\n",
+					image_mount_point);
+				return 0;
+			}
+			errno = EEXIST;
+			log_mount_failure(kmsg, errbuf, errbuf_size,
+				"keep /tmp directory");
+			return 1;
+		}
+		if (errno != ENOENT)
+		{
+			log_mount_failure(kmsg, errbuf, errbuf_size, "lstat /tmp");
+			return 1;
+		}
+		if (mkdir("/tmp", OFG_MKDIR_MODE) == 0 || errno == EEXIST)
+		{
+			my_printf("  created /tmp directory for image mountpoint %s\n",
+				image_mount_point);
+			pivot_debug_log("create /tmp directory for image mountpoint %s\n",
+				image_mount_point);
+			return 0;
+		}
+		log_mount_failure(kmsg, errbuf, errbuf_size, "mkdir /tmp");
+		return 1;
+	}
+
+	if (symlink("/var/volatile/tmp", "/tmp") == 0)
+	{
+		my_printf("  OK /tmp symlink\n");
+		pivot_debug_log("create /tmp symlink -> /var/volatile/tmp\n");
+		return 0;
+	}
+
+	if (errno == EEXIST && lstat("/tmp", &st) == 0 && S_ISLNK(st.st_mode))
+	{
+		link_len = readlink("/tmp", link_target, sizeof(link_target) - 1);
+		if (link_len >= 0)
+		{
+			link_target[link_len] = '\0';
+			if (strcmp(link_target, "/var/volatile/tmp") == 0)
+			{
+				my_printf("  OK existing /tmp symlink\n");
+				pivot_debug_log("keep existing /tmp symlink -> %s\n",
+					link_target);
+				return 0;
+			}
+		}
+	}
+
+	log_mount_failure(kmsg, errbuf, errbuf_size, "symlink /tmp");
+	return 1;
 }
 
 static void print_id(const uint8_t *id, size_t id_len) {
@@ -398,6 +507,7 @@ void printUsage()
 	my_printf("   -sNN --slotname=NN     user defined slot name\n");
 	my_printf("   -mx --multi=x          flash multiboot partition x (x= 1, 2, 3,...). Only supported by some boxes.\n");
 	my_printf("   -n --nowrite           show only found image and mtd partitions (no write)\n");
+	my_printf("   -p --pivot-only        reboot after post-pivot setup (debug, no flash)\n");
 	my_printf("   -f --force             force kill e2\n");
 	my_printf("   -q --quiet             show less output\n");
 	my_printf("   -h --help              show help\n");
@@ -534,7 +644,7 @@ int read_args(int argc, char *argv[])
 	int opt;
 	char *endptr;
 	long val;
-	static const char *short_options = "ac::k::r::ns:m:fqh";
+	static const char *short_options = "ac::k::r::ns:m:pfqh";
 	static const struct option long_options[] = {
 												{"android"      , no_argument, NULL, 'a'},
 												{"currentslot"  , optional_argument, NULL, 'c'},
@@ -543,6 +653,7 @@ int read_args(int argc, char *argv[])
 												{"nowrite"      , no_argument      , NULL, 'n'},
 												{"slotname"     , required_argument, NULL, 's'},
 												{"multi"        , required_argument, NULL, 'm'},
+												{"pivot-only"   , no_argument      , NULL, 'p'},
 												{"force"        , no_argument      , NULL, 'f'},
 												{"quiet"        , no_argument      , NULL, 'q'},
 												{"help"         , no_argument      , NULL, 'h'},
@@ -635,6 +746,9 @@ int read_args(int argc, char *argv[])
 			case 'n':
 				no_write = 1;
 				break;
+			case 'p':
+				pivot_only = 1;
+				break;
 			case 'f':
 				force_e2_stop = 1;
 				break;
@@ -649,6 +763,13 @@ int read_args(int argc, char *argv[])
 
 	if (argc == 1)
 	{
+		show_help = 1;
+		return 0;
+	}
+
+	if (pivot_only && no_write)
+	{
+		my_printf("Error: --pivot-only cannot be combined with --nowrite\n");
 		show_help = 1;
 		return 0;
 	}
@@ -1177,6 +1298,17 @@ int umount_rootfs(int steps)
 
 	int ret = 0;
 	my_printf("start umount_rootfs\n");
+	if (pivot_only && pivot_debug_fd < 0)
+	{
+		pivot_debug_fd = open("/home/root/ofgwrite-pivot.log",
+			O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (pivot_debug_fd >= 0)
+			pivot_debug_log("=== pivot-only start pid=%ld mountpoint=%s ===\n",
+				(long)getpid(), rootfs_mount_point);
+		else
+			my_printf("Warning: failed to open pivot debug log: %s\n",
+				strerror(errno));
+	}
 	set_root_mount_private();
 
 	// the start script creates /newroot dir and mount tmpfs on it
@@ -1386,6 +1518,8 @@ int umount_rootfs(int steps)
 	ret = chdir("/");
 
 	// move/create mounts in new root
+	char errbuf[256] = {0};
+	FILE *kmsg = NULL;
 	ret = 0;
 	if (init_sys == INIT_SYSTEMD)
 	{
@@ -1393,11 +1527,48 @@ int umount_rootfs(int steps)
 		// cannot be moved across peer groups, and private->slave is a no-op).
 		// Mount fresh virtual filesystems instead and bind-mount var/volatile
 		// (which may contain the image files under /tmp).
+		int r;
+		// Log to kernel ring buffer (survives reboot, readable via dmesg)
+		kmsg = fopen("/oldroot/dev/kmsg", "w");
 		my_printf("systemd: mounting fresh dev/proc/sys, bind var/volatile\n");
-		ret =  mount("devtmpfs", "dev/", "devtmpfs", 0, NULL);
-		ret += mount("proc", "proc/", "proc", 0, NULL);
-		ret += mount("sysfs", "sys/", "sysfs", 0, NULL);
-		ret += mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_BIND, NULL);
+		pivot_debug_log("systemd post-pivot setup start\n");
+		r = mount("devtmpfs", "dev/", "devtmpfs", 0, NULL);
+		if (r)
+			log_mount_failure(kmsg, errbuf, sizeof(errbuf), "devtmpfs->dev/");
+		else
+		{
+			my_printf("  OK devtmpfs\n");
+			pivot_debug_log("OK devtmpfs\n");
+		}
+		ret += (r != 0);
+		r = mount("proc", "proc/", "proc", 0, NULL);
+		if (r)
+			log_mount_failure(kmsg, errbuf, sizeof(errbuf), "proc->proc/");
+		else
+		{
+			my_printf("  OK proc\n");
+			pivot_debug_log("OK proc\n");
+		}
+		ret += (r != 0);
+		r = mount("sysfs", "sys/", "sysfs", 0, NULL);
+		if (r)
+			log_mount_failure(kmsg, errbuf, sizeof(errbuf), "sysfs->sys/");
+		else
+		{
+			my_printf("  OK sysfs\n");
+			pivot_debug_log("OK sysfs\n");
+		}
+		ret += (r != 0);
+		r = mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_BIND, NULL);
+		if (r)
+			log_mount_failure(kmsg, errbuf, sizeof(errbuf),
+				"bind var/volatile");
+		else
+		{
+			my_printf("  OK var/volatile\n");
+			pivot_debug_log("OK bind var/volatile\n");
+		}
+		ret += (r != 0);
 	}
 	else
 	{
@@ -1408,23 +1579,37 @@ int umount_rootfs(int steps)
 		ret += mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_MOVE, NULL);
 	}
 	// create link for tmp
-	ret += symlink("/var/volatile/tmp", "/tmp");
+	{
+		int r = setup_tmp_path(rootfs_mount_point, kmsg, errbuf,
+			sizeof(errbuf));
+		ret += (r != 0);
+	}
+	if (kmsg)
+		fclose(kmsg);
+	my_printf("mount setup result: ret=%d\n", ret);
+	pivot_debug_log("mount setup result: ret=%d\n", ret);
 	if (ret != 0)
 	{
-		my_printf("Error move mounts to newroot\n");
+		my_printf("Error move mounts to newroot (ret=%d)\n", ret);
 		set_error_text1("Error move mounts to newroot. Abort flashing!");
-		set_error_text2("Rebooting in 30 seconds!");
+		// Show which mount failed on framebuffer
+		if (errbuf[0])
+			set_error_text2(errbuf);
+		else
+			set_error_text2("Rebooting in 30 seconds!");
 		sleep(30);
 		reboot(LINUX_REBOOT_CMD_RESTART);
 		return 0;
 	}
+	int media_mount_ret;
+	int image_mount_ret = 0;
 	if (init_sys == INIT_SYSTEMD)
-		ret = mount("/oldroot/media/", "media/", NULL, MS_BIND, NULL);  // ignore return value
+		media_mount_ret = mount("/oldroot/media/", "media/", NULL, MS_BIND, NULL);  // ignore return value
 	else
-		ret = mount("/oldroot/media/", "media/", NULL, MS_MOVE, NULL);  // ignore return value
+		media_mount_ret = mount("/oldroot/media/", "media/", NULL, MS_MOVE, NULL);  // ignore return value
 
 	// move mount which includes the image files
-	if ((strncmp(rootfs_mount_point, "/media/", 7) == 0 && ret != 0)
+	if ((strncmp(rootfs_mount_point, "/media/", 7) == 0 && media_mount_ret != 0)
 	 ||  strncmp(rootfs_mount_point, "/var/volatile/", 14) != 0)
 	{
 		my_printf("Move mountpoint of image files\n");
@@ -1434,9 +1619,42 @@ int umount_rootfs(int steps)
 		my_printf("Moving %s to %s\n", oldroot_path, rootfs_mount_point);
 		// mount move/bind: ignore errors as e.g. network shares cannot be moved
 		if (init_sys == INIT_SYSTEMD)
-			mount(oldroot_path, rootfs_mount_point, NULL, MS_BIND, NULL);
+			image_mount_ret = mount(oldroot_path, rootfs_mount_point, NULL, MS_BIND, NULL);
 		else
-			mount(oldroot_path, rootfs_mount_point, NULL, MS_MOVE, NULL);
+			image_mount_ret = mount(oldroot_path, rootfs_mount_point, NULL, MS_MOVE, NULL);
+		if (image_mount_ret != 0)
+		{
+			my_printf("Warning: failed to relocate image mountpoint: %s\n",
+				strerror(errno));
+			pivot_debug_log("WARN image mountpoint relocate %s -> %s: %s\n",
+				oldroot_path, rootfs_mount_point, strerror(errno));
+		}
+		else
+			pivot_debug_log("OK image mountpoint relocate %s -> %s\n",
+				oldroot_path, rootfs_mount_point);
+	}
+
+	if (pivot_only)
+	{
+		FILE *pivot_kmsg = fopen("/oldroot/dev/kmsg", "w");
+		if (pivot_kmsg)
+		{
+			if (image_mount_ret == 0)
+				fprintf(pivot_kmsg,
+					"<6>ofgwrite: pivot-only success for mountpoint %s\n",
+					rootfs_mount_point);
+			else
+				fprintf(pivot_kmsg,
+					"<4>ofgwrite: pivot-only image mountpoint warning for %s\n",
+					rootfs_mount_point);
+			fclose(pivot_kmsg);
+		}
+		pivot_debug_log("pivot-only success, rebooting without flash\n");
+		my_printf("Pivot-only debug mode: post-pivot setup validated, skipping flash\n");
+		set_step("Pivot-only debug OK, rebooting in 5 seconds");
+		sleep(5);
+		reboot(LINUX_REBOOT_CMD_RESTART);
+		return 0;
 	}
 
 	// umount all unneeded filesystems
