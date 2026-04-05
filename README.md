@@ -1,15 +1,31 @@
-ofgwrite
-========
+# ofgwrite
 
-ofgwrite from Betacentauri: Based upon: mtd-utils-native-1.5.1 and busybox 1.24.1
+ofgwrite from Betacentauri, based on mtd-utils-native-1.5.1 and busybox 1.24.1.
 
-Usage: ofgwrite &lt;parameter&gt; &lt;image_directory&gt;  
-Options:  
--k --kernel flash kernel (default)  
--r --rootfs flash root (default)  
--n --nowrite show only found image and mtd partitions (no write)  
--h --help show help  
+This fork is maintained by tuxbox-neutrino.
+Focus: robust, reproducible, branding-free flash integration for
+Tuxbox/Neutrino targets.
 
-Warning:  
-Run the program once with -n parameter and check whether mtd partitions   
-are recognized properly. If not, don't use this tool!!!
+Upstream base: https://github.com/oe-alliance/ofgwrite
+
+## Usage
+
+`ofgwrite <parameter> <image_directory>`
+
+Options:
+- `-k --kernel` flash kernel (default)
+- `-r --rootfs` flash rootfs (default)
+- `-n --nowrite` detect image and target devices without writing
+- `-h --help` show help
+
+## Safety
+
+Run once with `-n` and verify device detection before any real write.
+If detection is wrong, do not flash.
+
+## Fork Policy
+
+- Keep upstream history and attribution intact.
+- Keep runtime output and behavior branding-free.
+- Carry technical changes for stability, compatibility, and safety.
+- Pin integration in build layers by fixed `SRCREV`.
