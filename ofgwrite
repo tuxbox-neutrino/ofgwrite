@@ -1,6 +1,34 @@
 #!/bin/sh
 
-mkdir /newroot
+set -e
+
+cleanup_newroot() {
+	while grep -q " /newroot " /proc/mounts 2>/dev/null; do
+		umount -l /newroot >/dev/null 2>&1 || true
+		sleep 0.2
+	done
+	rm -rf /newroot >/dev/null 2>&1 || true
+}
+
+cleanup_newroot
+
+mkdir -p /newroot
 mount -t tmpfs tmpfs /newroot
+
+if [ -e /tmp/backup_flash.tar.gz ]; then
+	mv /tmp/backup_flash.tar.gz /newroot/
+fi
+
 cp -p /usr/bin/ofgwrite_bin /newroot/
+
+# Prevent mount propagation surprises on systemd-based systems before pivot_root.
+mount --make-rprivate / >/dev/null 2>&1 || true
+
 /newroot/ofgwrite_bin "$@"
+rc=$?
+
+# Only clean up /newroot if ofgwrite_bin failed. Exit 0 means the process
+# daemonized successfully and the flash is still running in the background.
+if [ "$rc" -ne 0 ]; then
+	cleanup_newroot
+fi
