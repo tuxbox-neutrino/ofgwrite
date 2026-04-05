@@ -110,7 +110,7 @@ enum RootfsTypeEnum rootfs_type;
 int stop_e2_needed = 1;
 int chkroot_mode = 0;
 
-const char ofgwrite_version[] = "4.8.0.2";
+const char ofgwrite_version[] = "4.8.0.3";
 
 struct struct_mountlist
 {
@@ -1384,11 +1384,29 @@ int umount_rootfs(int steps)
 	}
 
 	ret = chdir("/");
-	// move mounts to new root
-	ret =  mount("/oldroot/dev/", "dev/", NULL, MS_MOVE, NULL);
-	ret += mount("/oldroot/proc/", "proc/", NULL, MS_MOVE, NULL);
-	ret += mount("/oldroot/sys/", "sys/", NULL, MS_MOVE, NULL);
-	ret += mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_MOVE, NULL);
+
+	// move/create mounts in new root
+	ret = 0;
+	if (init_sys == INIT_SYSTEMD)
+	{
+		// systemd: MS_REC|MS_PRIVATE on "/" prevents MS_MOVE (private mounts
+		// cannot be moved across peer groups, and private->slave is a no-op).
+		// Mount fresh virtual filesystems instead and bind-mount var/volatile
+		// (which may contain the image files under /tmp).
+		my_printf("systemd: mounting fresh dev/proc/sys, bind var/volatile\n");
+		ret =  mount("devtmpfs", "dev/", "devtmpfs", 0, NULL);
+		ret += mount("proc", "proc/", "proc", 0, NULL);
+		ret += mount("sysfs", "sys/", "sysfs", 0, NULL);
+		ret += mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_BIND, NULL);
+	}
+	else
+	{
+		// sysvinit: MS_MOVE works normally
+		ret =  mount("/oldroot/dev/", "dev/", NULL, MS_MOVE, NULL);
+		ret += mount("/oldroot/proc/", "proc/", NULL, MS_MOVE, NULL);
+		ret += mount("/oldroot/sys/", "sys/", NULL, MS_MOVE, NULL);
+		ret += mount("/oldroot/var/volatile", "var/volatile/", NULL, MS_MOVE, NULL);
+	}
 	// create link for tmp
 	ret += symlink("/var/volatile/tmp", "/tmp");
 	if (ret != 0)
@@ -1400,7 +1418,10 @@ int umount_rootfs(int steps)
 		reboot(LINUX_REBOOT_CMD_RESTART);
 		return 0;
 	}
-	ret = mount("/oldroot/media/", "media/", NULL, MS_MOVE, NULL);  // ignore return value
+	if (init_sys == INIT_SYSTEMD)
+		ret = mount("/oldroot/media/", "media/", NULL, MS_BIND, NULL);  // ignore return value
+	else
+		ret = mount("/oldroot/media/", "media/", NULL, MS_MOVE, NULL);  // ignore return value
 
 	// move mount which includes the image files
 	if ((strncmp(rootfs_mount_point, "/media/", 7) == 0 && ret != 0)
@@ -1411,8 +1432,11 @@ int umount_rootfs(int steps)
 		strcpy(oldroot_path, "/oldroot");
 		strcat(oldroot_path, rootfs_mount_point);
 		my_printf("Moving %s to %s\n", oldroot_path, rootfs_mount_point);
-		// mount move: ignore errors as e.g. network shares cannot be moved
-		mount(oldroot_path, rootfs_mount_point, NULL, MS_MOVE, NULL);
+		// mount move/bind: ignore errors as e.g. network shares cannot be moved
+		if (init_sys == INIT_SYSTEMD)
+			mount(oldroot_path, rootfs_mount_point, NULL, MS_BIND, NULL);
+		else
+			mount(oldroot_path, rootfs_mount_point, NULL, MS_MOVE, NULL);
 	}
 
 	// umount all unneeded filesystems
