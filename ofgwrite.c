@@ -2130,8 +2130,9 @@ int main(int argc, char *argv[])
 	{
 		ret = 0;
 
-		// Check whether /newroot exists and is mounted as tmpfs
-		if (!check_env())
+		// /newroot tmpfs is only needed when active-slot flash does pivot_root.
+		// Inactive-slot flash mounts rootfs_device directly to /oldroot_remount/.
+		if (stop_e2_needed && !check_env())
 		{
 			closelog();
 			return EXIT_FAILURE;
@@ -2202,8 +2203,9 @@ int main(int argc, char *argv[])
 				return EXIT_FAILURE;
 			}
 		}
-		// if not running rootfs is flashed then we need to mount it before start flashing
-		if (!no_write && !stop_e2_needed && (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD || rootfs_flash_mode == UBI_LOOP_SUBDIR || rootfs_flash_mode == TARXZ_UBI))
+		// if not running rootfs is flashed then we need to mount it before start flashing.
+		// Mount also in dryrun (-n) so the target path can be validated.
+		if (!stop_e2_needed && (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD || rootfs_flash_mode == UBI_LOOP_SUBDIR || rootfs_flash_mode == TARXZ_UBI))
 		{
 			set_step("Mount rootfs");
 			my_printf("Mount rootfs\n");

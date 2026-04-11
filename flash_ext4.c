@@ -159,36 +159,99 @@ int flash_unpack_rootfs(char* filename, int quiet, int no_write)
 {
 	int ret;
 	char path[1000];
+	char backup_path[1000];
+	int has_backup = 0;
+	int has_subdir = (current_rootfs_sub_dir[0] != '\0' && rootsubdir_check == 0);
 
-	// instead of creating new filesystem just delete whole content
-	set_step("Deleting rootfs");
 	strcpy(path, "/oldroot_remount/");
-	if (current_rootfs_sub_dir[0] != '\0' && rootsubdir_check == 0) // box with rootSubDir feature
+	if (has_subdir) // box with rootSubDir feature
 	{
 		strcat(path, rootfs_sub_dir);
 		strcat(path, "/");
 	}
+
 	if (!no_write)
 	{
-		ret = rm_rootfs(path, quiet, no_write); // ignore return value as it always fails, because oldroot_remount cannot be removed
+		if (has_subdir)
+		{
+			// Safety: rename old rootfs instead of deleting immediately.
+			// If extraction fails, the old content can be restored.
+			snprintf(backup_path, sizeof(backup_path),
+				"/oldroot_remount/%s.old/", rootfs_sub_dir);
+			// Remove stale backup from a previous failed attempt
+			rm_rootfs(backup_path, quiet, 0);
+			rmdir(backup_path);
+
+			set_step("Moving old rootfs");
+			my_printf("Renaming %s -> %s\n", path, backup_path);
+			if (rename(path, backup_path) == 0)
+			{
+				has_backup = 1;
+				// Recreate empty target directory
+				if (mkdir(path, 0777) != 0)
+				{
+					my_printf("Error creating rootfs dir %s: %s\n", path, strerror(errno));
+					// Restore backup
+					rename(backup_path, path);
+					return 0;
+				}
+			}
+			else
+			{
+				my_printf("Rename failed (%s), falling back to delete\n", strerror(errno));
+				set_step("Deleting rootfs");
+				rm_rootfs(path, quiet, 0);
+			}
+		}
+		else
+		{
+			// No subdir: original delete behavior (active-slot pivot_root path)
+			set_step("Deleting rootfs");
+			rm_rootfs(path, quiet, 0);
+		}
+	}
+
+	// Ensure target subdir exists before tar extraction
+	if (!no_write && has_subdir)
+	{
+		if (mkdir(path, 0777) != 0 && errno != EEXIST)
+		{
+			my_printf("Error creating rootfs directory %s: %s\n", path, strerror(errno));
+			if (has_backup)
+			{
+				my_printf("Restoring previous rootfs from backup\n");
+				rmdir(path);
+				rename(backup_path, path);
+			}
+			return 0;
+		}
 	}
 
 	set_step("Extracting rootfs");
 	set_step_progress(0);
-	if (!no_write && current_rootfs_sub_dir[0] != '\0' && rootsubdir_check == 0) // box with rootSubDir feature
-	{
-		// Ensure target subdir exists before tar extraction.
-		if (mkdir(path, 0777) != 0 && errno != EEXIST)
-		{
-			my_printf("Error creating rootfs directory %s: %s\n", path, strerror(errno));
-			return 0;
-		}
-	}
 	if (!untar_rootfs(filename, path, quiet, no_write))
 	{
 		my_printf("Error extracting rootfs\n");
+		if (has_backup)
+		{
+			my_printf("Restoring previous rootfs from backup\n");
+			set_step("Restoring old rootfs");
+			rm_rootfs(path, quiet, 0);
+			rmdir(path);
+			rename(backup_path, path);
+		}
 		return 0;
 	}
+
+	// Success: delete old backup
+	if (has_backup)
+	{
+		set_step("Cleaning up old rootfs");
+		my_printf("Removing old rootfs backup %s\n", backup_path);
+		rm_rootfs(backup_path, quiet, 0);
+		rmdir(backup_path);
+	}
+
 	// sync filesystem double because of sdcard
 	sync();
 	sync();
