@@ -85,6 +85,7 @@ char current_rootfs_sub_dir[1000];
 char ubi_fs_name[1000];
 char ubi_loop_device[1000];
 int loop_mtd_device = 99999;
+char profile_conf_path[1000] = "/etc/tuxbox/flash-machine-profile.conf";
 
 enum FlashModeTypeEnum kernel_flash_mode;
 enum FlashModeTypeEnum rootfs_flash_mode;
@@ -1767,6 +1768,262 @@ void ext4_rootfs_dev_found(const char* dev, int partition_number)
 	my_printf("Using %s as rootfs device\n", rootfs_device);
 }
 
+/* Parse a partition number from the tail of a device name like "mmcblk0p19".
+ * Returns the number (19) or -1 on failure. Sets *prefix_len to the offset
+ * of the numeric suffix so the caller can reconstruct the base path.
+ */
+static int parse_dev_partition_nr(const char* dev, int* prefix_len)
+{
+	int len = strlen(dev);
+	int i = len - 1;
+	while (i >= 0 && dev[i] >= '0' && dev[i] <= '9')
+		i--;
+	if (i == len - 1) // no digit at end
+		return -1;
+	if (prefix_len)
+		*prefix_len = i + 1;
+	return atoi(dev + i + 1);
+}
+
+/* Detect kernel and rootfs devices from flash-machine-profile.conf.
+ * The config file is generated at build time by the Yocto flash-script recipe
+ * and provides deterministic device paths per machine.
+ *
+ * Returns 1 if both devices were resolved, 0 otherwise.
+ */
+int detect_via_profile_conf(void)
+{
+	FILE* f;
+	char line[512];
+	char key[256];
+	char value[256];
+	char mtd_kernel[256] = "";
+	char mtd_rootfs[256] = "";
+	int slot;
+
+	f = fopen(profile_conf_path, "r");
+	if (f == NULL)
+	{
+		my_printf("Profile config %s not found\n", profile_conf_path);
+		return 0;
+	}
+
+	my_printf("Reading profile config: %s\n", profile_conf_path);
+
+	while (fgets(line, sizeof(line), f) != NULL)
+	{
+		// Parse KEY="VALUE" lines
+		if (sscanf(line, "%255[^=]=\"%255[^\"]\"", key, value) == 2)
+		{
+			if (strcmp(key, "FLASH_MTD_KERNEL") == 0)
+				strncpy(mtd_kernel, value, sizeof(mtd_kernel) - 1);
+			else if (strcmp(key, "FLASH_MTD_ROOTFS") == 0)
+				strncpy(mtd_rootfs, value, sizeof(mtd_rootfs) - 1);
+		}
+	}
+	fclose(f);
+
+	if (mtd_kernel[0] == '\0' || mtd_rootfs[0] == '\0')
+	{
+		my_printf("Profile config: FLASH_MTD_KERNEL or FLASH_MTD_ROOTFS missing\n");
+		return 0;
+	}
+
+	my_printf("Profile config: base kernel=%s rootfs=%s\n", mtd_kernel, mtd_rootfs);
+
+	// Determine flash mode from device name prefix
+	if (strncmp(mtd_kernel, "mtd", 3) == 0)
+	{
+		kernel_flash_mode = MTD;
+		rootfs_flash_mode = MTD;
+	}
+	else
+	{
+		kernel_flash_mode = TARBZ2;
+		rootfs_flash_mode = TARBZ2;
+	}
+
+	// Resolve kernel device with multiboot offset
+	slot = (multiboot_partition > 0) ? multiboot_partition : 1;
+	if (kernel_flash_mode == TARBZ2 && slot > 1)
+	{
+		// eMMC multiboot: kernel partitions are sequential
+		// e.g. slot1=mmcblk0p19, slot2=mmcblk0p20, ...
+		int prefix_len = 0;
+		int base_nr = parse_dev_partition_nr(mtd_kernel, &prefix_len);
+		if (base_nr >= 0)
+		{
+			int target_nr = base_nr + (slot - 1);
+			char dev_base[256];
+			strncpy(dev_base, mtd_kernel, prefix_len);
+			dev_base[prefix_len] = '\0';
+			sprintf(kernel_device, "/dev/%s%d", dev_base, target_nr);
+		}
+		else
+		{
+			sprintf(kernel_device, "/dev/%s", mtd_kernel);
+		}
+	}
+	else
+	{
+		sprintf(kernel_device, "/dev/%s", mtd_kernel);
+	}
+
+	// Rootfs device (stays the same for all slots on userdata partition)
+	sprintf(rootfs_device, "/dev/%s", mtd_rootfs);
+
+	// Set rootfs subdirectory for multiboot
+	if ((current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
+		&& rootsubdir_check == 0)
+	{
+		sprintf(rootfs_sub_dir, "%s%d", slotname, slot);
+	}
+
+	found_kernel_device = 1;
+	found_rootfs_device = 1;
+
+	my_printf("Profile config: kernel=%s rootfs=%s sub_dir=%s\n",
+		kernel_device, rootfs_device, rootfs_sub_dir);
+	return 1;
+}
+
+/* Detect kernel and rootfs devices via /dev/disk/by-partlabel/ symlinks.
+ * This directory is maintained by the kernel/udev for GPT-partitioned
+ * block devices and provides a deterministic mapping from partition
+ * labels to device nodes.
+ *
+ * Returns 1 if both devices were resolved, 0 otherwise.
+ */
+int detect_via_partlabel(void)
+{
+	static const char* partlabel_dir = "/dev/disk/by-partlabel";
+	DIR* dir;
+	struct dirent* entry;
+	char kernel_label[128] = "";
+	char rootfs_label[128] = "";
+	char path[512];
+	char resolved[512];
+	int slot;
+	int found_kern = 0;
+	int found_root = 0;
+	int use_userdata = 0;
+
+	dir = opendir(partlabel_dir);
+	if (dir == NULL)
+	{
+		my_printf("Partlabel dir %s not available\n", partlabel_dir);
+		return 0;
+	}
+
+	slot = (multiboot_partition > 0) ? multiboot_partition : 1;
+
+	// Build expected label names for this slot
+	// Try linuxkernel{N} first (HD60 style), then kernel{N}
+	char try_kernel_labels[4][64];
+	int n_kernel_labels = 0;
+	sprintf(try_kernel_labels[n_kernel_labels++], "linuxkernel%d", slot);
+	if (slot == 1)
+		sprintf(try_kernel_labels[n_kernel_labels++], "linuxkernel");
+	sprintf(try_kernel_labels[n_kernel_labels++], "kernel%d", slot);
+	if (slot == 1)
+		sprintf(try_kernel_labels[n_kernel_labels++], "kernel");
+
+	// Rootfs: try userdata first (shared partition with subdirs),
+	// then dedicated partition labels
+	char try_rootfs_labels[4][64];
+	int n_rootfs_labels = 0;
+	if (current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
+	{
+		sprintf(try_rootfs_labels[n_rootfs_labels++], "userdata");
+	}
+	sprintf(try_rootfs_labels[n_rootfs_labels++], "linuxrootfs%d", slot);
+	if (slot == 1)
+		sprintf(try_rootfs_labels[n_rootfs_labels++], "linuxrootfs");
+	sprintf(try_rootfs_labels[n_rootfs_labels++], "rootfs%d", slot);
+
+	while ((entry = readdir(dir)) != NULL)
+	{
+		if (entry->d_name[0] == '.')
+			continue;
+
+		// Check kernel labels
+		if (!found_kern)
+		{
+			for (int i = 0; i < n_kernel_labels; i++)
+			{
+				if (strcmp(entry->d_name, try_kernel_labels[i]) == 0)
+				{
+					strcpy(kernel_label, entry->d_name);
+					found_kern = 1;
+					break;
+				}
+			}
+		}
+
+		// Check rootfs labels
+		if (!found_root)
+		{
+			for (int i = 0; i < n_rootfs_labels; i++)
+			{
+				if (strcmp(entry->d_name, try_rootfs_labels[i]) == 0)
+				{
+					strcpy(rootfs_label, entry->d_name);
+					found_root = 1;
+					if (strcmp(entry->d_name, "userdata") == 0)
+						use_userdata = 1;
+					break;
+				}
+			}
+		}
+
+		if (found_kern && found_root)
+			break;
+	}
+	closedir(dir);
+
+	if (!found_kern || !found_root)
+	{
+		my_printf("Partlabel: kernel=%s rootfs=%s (incomplete)\n",
+			found_kern ? kernel_label : "(not found)",
+			found_root ? rootfs_label : "(not found)");
+		return 0;
+	}
+
+	// Resolve symlinks to actual device paths
+	snprintf(path, sizeof(path), "%s/%s", partlabel_dir, kernel_label);
+	if (realpath(path, resolved) == NULL)
+	{
+		my_printf("Partlabel: cannot resolve %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+	strcpy(kernel_device, resolved);
+
+	snprintf(path, sizeof(path), "%s/%s", partlabel_dir, rootfs_label);
+	if (realpath(path, resolved) == NULL)
+	{
+		my_printf("Partlabel: cannot resolve %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+	strcpy(rootfs_device, resolved);
+
+	// Partlabels only exist for block devices (GPT)
+	kernel_flash_mode = TARBZ2;
+	rootfs_flash_mode = TARBZ2;
+
+	// Set rootfs subdirectory for userdata layout
+	if (use_userdata && rootsubdir_check == 0)
+	{
+		sprintf(rootfs_sub_dir, "%s%d", slotname, slot);
+	}
+
+	found_kernel_device = 1;
+	found_rootfs_device = 1;
+
+	my_printf("Partlabel: kernel=%s (%s) rootfs=%s (%s) sub_dir=%s\n",
+		kernel_label, kernel_device, rootfs_label, rootfs_device, rootfs_sub_dir);
+	return 1;
+}
+
 void find_store_substring(char* src, char* cmp, char* dest)
 {
 	char* pos;
@@ -1858,15 +2115,83 @@ void readProcCmdline()
 void find_kernel_rootfs_device()
 {
 	int mtd_kernel_found = found_kernel_device;
-	// get kernel/rootfs from cmdline
+
+	// Always read /proc/cmdline first: populates current_rootfs_device,
+	// current_kernel_device, current_rootfs_sub_dir, kexec_mode, boxname.
+	// Also attempts blkdevparts parsing as a side effect.
 	readProcCmdline();
 
-	if ((!found_kernel_device || !found_rootfs_device) && strcmp(kexec_mode, "1") != 0) // Both kernel and rootfs needs to be found. Otherwise ignore found devices
+	// Save blkdevparts result and reset — deterministic methods get priority
+	int cmdline_found_kernel = found_kernel_device;
+	int cmdline_found_rootfs = found_rootfs_device;
+	char cmdline_kernel_device[1000] = "";
+	char cmdline_rootfs_device[1000] = "";
+	char cmdline_rootfs_sub_dir[1000] = "";
+	enum FlashModeTypeEnum cmdline_kernel_flash_mode = kernel_flash_mode;
+	enum FlashModeTypeEnum cmdline_rootfs_flash_mode = rootfs_flash_mode;
+	if (cmdline_found_kernel)
+		strncpy(cmdline_kernel_device, kernel_device, sizeof(cmdline_kernel_device) - 1);
+	if (cmdline_found_rootfs)
+	{
+		strncpy(cmdline_rootfs_device, rootfs_device, sizeof(cmdline_rootfs_device) - 1);
+		strncpy(cmdline_rootfs_sub_dir, rootfs_sub_dir, sizeof(cmdline_rootfs_sub_dir) - 1);
+	}
+
+	// Reset for deterministic detection (unless user specified via CLI)
+	if (!user_kernel && !mtd_kernel_found)
+		found_kernel_device = 0;
+	if (!user_rootfs)
+		found_rootfs_device = 0;
+
+	// Priority 2: flash-machine-profile.conf (deterministic, build-time config)
+	if (!user_kernel && !user_rootfs
+		&& (!found_kernel_device || !found_rootfs_device))
+	{
+		my_printf("\n--- Detection: profile config ---\n");
+		if (detect_via_profile_conf())
+			my_printf("Profile config: success\n");
+		else
+			my_printf("Profile config: not available or incomplete\n");
+	}
+
+	// Priority 3: /dev/disk/by-partlabel/ (deterministic, kernel-maintained)
+	if (!found_kernel_device || !found_rootfs_device)
+	{
+		my_printf("\n--- Detection: partlabel ---\n");
+		if (detect_via_partlabel())
+			my_printf("Partlabel: success\n");
+		else
+			my_printf("Partlabel: not available or incomplete\n");
+	}
+
+	// Priority 4: blkdevparts from /proc/cmdline (restore saved result)
+	if (!found_kernel_device || !found_rootfs_device)
+	{
+		my_printf("\n--- Detection: cmdline blkdevparts fallback ---\n");
+		if (!found_kernel_device && cmdline_found_kernel)
+		{
+			found_kernel_device = 1;
+			strncpy(kernel_device, cmdline_kernel_device, sizeof(kernel_device) - 1);
+			kernel_flash_mode = cmdline_kernel_flash_mode;
+			my_printf("Restored kernel from cmdline: %s\n", kernel_device);
+		}
+		if (!found_rootfs_device && cmdline_found_rootfs)
+		{
+			found_rootfs_device = 1;
+			strncpy(rootfs_device, cmdline_rootfs_device, sizeof(rootfs_device) - 1);
+			strncpy(rootfs_sub_dir, cmdline_rootfs_sub_dir, sizeof(rootfs_sub_dir) - 1);
+			rootfs_flash_mode = cmdline_rootfs_flash_mode;
+			my_printf("Restored rootfs from cmdline: %s (sub_dir: %s)\n", rootfs_device, rootfs_sub_dir);
+		}
+		if (found_kernel_device && found_rootfs_device)
+			my_printf("Cmdline blkdevparts: success\n");
+	}
+
+	// Priority 5: fdisk -l fallback (legacy heuristic)
+	if ((!found_kernel_device || !found_rootfs_device) && strcmp(kexec_mode, "1") != 0)
 	{
 		found_kernel_device = 0;
 		found_rootfs_device = 0;
-		// get kernel/rootfs from fdisk
-		// call fdisk -l
 		optind = 0; // reset getopt_long
 		char* argv[] = {
 			"fdisk",		// program name
@@ -1875,14 +2200,14 @@ void find_kernel_rootfs_device()
 		};
 		int argc = (int)(sizeof(argv) / sizeof(argv[0])) - 1;
 
+		my_printf("\n--- Detection: fdisk fallback ---\n");
 		my_printf("Execute: fdisk -l\n");
 		if (fdisk_main(argc, argv) != 0)
-			return;
+			my_printf("fdisk fallback: failed\n");
 	}
 
 	if (!found_kernel_device && mtd_kernel_found)
 		found_kernel_device = 1;
-
 
 	// force user kernel/rootfs
 	if (user_rootfs && rootfs_flash_mode != TARBZ2_MTD && rootfs_flash_mode != MTD)
@@ -2049,6 +2374,11 @@ int main(int argc, char *argv[])
 	kernel_flash_mode = FLASH_MODE_UNKNOWN;
 	rootfs_flash_mode = FLASH_MODE_UNKNOWN;
 	ubi_fs_name[0] = '\0';
+
+	// Allow override of profile config path via environment
+	const char *env_profile = getenv("FLASH_MACHINE_PROFILE_PATH");
+	if (env_profile && env_profile[0] != '\0')
+		snprintf(profile_conf_path, sizeof(profile_conf_path), "%s", env_profile);
 
 	ret = read_args(argc, argv);
 

@@ -68,6 +68,11 @@ void close_framebuffer();
 void set_overall_text(char* str);
 int show_main_window(int show_background_image, const char* version);
 
+/* Data-driven device detection (cascade priorities 2 and 3) */
+int detect_via_profile_conf(void);
+int detect_via_partlabel(void);
+extern char profile_conf_path[1000];
+
 int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int quiet, int no_write);
 int flash_unpack_rootfs(char* filename, int quiet, int no_write);
 int flash_ubi_jffs2_kernel(char* device, char* filename, int quiet, int no_write);

@@ -1,0 +1,184 @@
+#!/bin/sh
+set -eu
+
+BACKEND_SCRIPT="${OFGWRITE_BACKEND_SCRIPT:-/usr/libexec/tuxbox/flash-backend-ofgwrite.sh}"
+OFGWRITE_BIN="${OFGWRITE_BIN:-ofgwrite}"
+
+usage() {
+	cat <<'EOF'
+Usage: ofgwrite_caller <update-dir> <update-package> [ofgwrite-options]
+
+Examples:
+  ofgwrite_caller /tmp /tmp/image.zip -m2
+  ofgwrite_caller /media/hdd/update image.tgz "-f -m3"
+EOF
+}
+
+fail() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+has_kernel_file() {
+	dir="$1"
+	[ -f "${dir}/kernel.bin" ] || [ -f "${dir}/uImage" ] || ls "${dir}"/*kernel*.bin >/dev/null 2>&1
+}
+
+has_rootfs_file() {
+	dir="$1"
+	for name in \
+		rootfs.bin \
+		root_cfe_auto.bin \
+		root_cfe_auto.jffs2 \
+		oe_rootfs.bin \
+		e2jffs2.img \
+		rootfs.tar.bz2 \
+		rootfs.ubi \
+		rootfs.tar.xz \
+		rootfs-one.tar.bz2 \
+		rootfs-two.tar.bz2; do
+		if [ -f "${dir}/${name}" ]; then
+			return 0
+		fi
+	done
+
+	ls "${dir}"/*.nfi >/dev/null 2>&1 && return 0
+	ls "${dir}"/*.tar.xz >/dev/null 2>&1 && return 0
+	return 1
+}
+
+find_image_dir() {
+	base="$1"
+	if has_kernel_file "${base}" && has_rootfs_file "${base}"; then
+		echo "${base}"
+		return 0
+	fi
+
+	find "${base}" -mindepth 1 -maxdepth 3 -type d 2>/dev/null | while IFS= read -r d; do
+		if has_kernel_file "${d}" && has_rootfs_file "${d}"; then
+			echo "${d}"
+			exit 0
+		fi
+	done
+}
+
+extract_package() {
+	pkg="$1"
+	dst="$2"
+
+	case "${pkg}" in
+		*.zip)
+			command -v unzip >/dev/null 2>&1 || fail "unzip is required for ${pkg}"
+			unzip -oq "${pkg}" -x '*disk.img*' -d "${dst}" || fail "unzip failed: ${pkg}"
+			;;
+		*.tgz|*.tar.gz)
+			tar -xzf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*.tar.bz2)
+			tar -xjf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*.tar.xz)
+			tar -xJf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*)
+			fail "unsupported package format: ${pkg}"
+			;;
+	esac
+}
+
+parse_option_string() {
+	opt_str="$1"
+	slot=""
+	force="0"
+
+	# shellcheck disable=SC2086
+	set -- ${opt_str}
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-m)
+				shift
+				[ "$#" -gt 0 ] || fail "missing value for -m"
+				slot="$1"
+				;;
+			-m[0-9]*)
+				slot="${1#-m}"
+				;;
+			-f)
+				force="1"
+				;;
+		esac
+		shift
+	done
+
+	echo "${slot}|${force}"
+}
+
+[ "$#" -ge 2 ] || { usage; exit 1; }
+
+update_dir="$1"
+update_pkg="$2"
+opt_str="${3:-}"
+
+case "${update_pkg}" in
+	/*)
+		pkg_path="${update_pkg}"
+		;;
+	*)
+		pkg_path="${update_dir%/}/${update_pkg}"
+		;;
+esac
+
+[ -f "${pkg_path}" ] || fail "update package not found: ${pkg_path}"
+
+work_base="/tmp"
+if [ -d "${update_dir}" ] && [ -w "${update_dir}" ]; then
+	work_base="${update_dir}"
+fi
+
+workdir="$(mktemp -d "${work_base%/}/ofgwrite-caller-XXXXXX")"
+cleanup_enabled="1"
+cleanup() {
+	[ "${cleanup_enabled}" = "1" ] || return 0
+	rm -rf "${workdir}"
+}
+trap cleanup EXIT INT TERM
+
+extract_package "${pkg_path}" "${workdir}"
+
+image_dir="$(find_image_dir "${workdir}" || true)"
+[ -n "${image_dir}" ] || fail "could not detect kernel/rootfs payload in extracted update package"
+
+parsed="$(parse_option_string "${opt_str}")"
+slot="${parsed%%|*}"
+force="${parsed##*|}"
+
+if [ -n "${slot}" ] && [ -x "${BACKEND_SCRIPT}" ]; then
+	if [ "${force}" = "1" ]; then
+		"${BACKEND_SCRIPT}" "${slot}" "${image_dir}" force
+	else
+		"${BACKEND_SCRIPT}" "${slot}" "${image_dir}"
+	fi
+	rc=$?
+	if [ "${rc}" -eq 0 ]; then
+		cleanup_enabled="0"
+		printf '%s\n' "Preserving extracted payload in ${workdir} while flash continues" >&2
+	fi
+	exit "${rc}"
+fi
+
+command -v "${OFGWRITE_BIN}" >/dev/null 2>&1 || fail "ofgwrite binary not found"
+if [ -n "${opt_str}" ]; then
+	# shellcheck disable=SC2086
+	set -- ${opt_str}
+	"${OFGWRITE_BIN}" "$@" "${image_dir}"
+else
+	"${OFGWRITE_BIN}" "${image_dir}"
+fi
+
+rc=$?
+if [ "${rc}" -eq 0 ]; then
+	cleanup_enabled="0"
+	printf '%s\n' "Preserving extracted payload in ${workdir} while flash continues" >&2
+fi
+
+exit "${rc}"
