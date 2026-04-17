@@ -68,10 +68,31 @@ void close_framebuffer();
 void set_overall_text(char* str);
 int show_main_window(int show_background_image, const char* version);
 
+/* Stable exit codes (contract: docs/ONLINE-FLASH-CONCEPT.md) */
+#define OFG_EXIT_SUCCESS             0
+#define OFG_EXIT_GENERIC_FAILURE     1
+#define OFG_EXIT_INVALID_INPUT       2
+#define OFG_EXIT_PREFLIGHT_FAIL      3
+#define OFG_EXIT_WRITE_FAILURE       4
+#define OFG_EXIT_INTEGRITY_FAIL      5
+#define OFG_EXIT_ACTIVE_SLOT_BLOCKED 6
+/* 127 = missing binary, handled by the shell */
+
 /* Data-driven device detection (cascade priorities 2 and 3) */
 int detect_via_profile_conf(void);
 int detect_via_partlabel(void);
 extern char profile_conf_path[1000];
+
+/* Pre-flash injection into target rootfs */
+int inject_backup(const char *tarball, const char *target_rootfs);
+int inject_marker(const char *marker_json, const char *target_rootfs);
+int apply_keep_last(int keep_n, const char *target_rootfs);
+
+/* New CLI flags */
+extern int allow_active_slot;
+extern char inject_backup_path[1000];
+extern char inject_marker_path[1000];
+extern int keep_last_n;
 
 int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int quiet, int no_write);
 int flash_unpack_rootfs(char* filename, int quiet, int no_write);

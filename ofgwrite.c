@@ -20,6 +20,7 @@
 
 #define SHA_DIGEST_LENGTH 20
 #define OFG_MKDIR_MODE 0777
+#define UI "Neutrino"
 
 typedef struct {
     // ... (other header fields)
@@ -86,6 +87,11 @@ char ubi_fs_name[1000];
 char ubi_loop_device[1000];
 int loop_mtd_device = 99999;
 char profile_conf_path[1000] = "/etc/tuxbox/flash-machine-profile.conf";
+
+int allow_active_slot = 0;
+char inject_backup_path[1000] = "";
+char inject_marker_path[1000] = "";
+int keep_last_n = -1;  /* -1 = disabled */
 
 enum FlashModeTypeEnum kernel_flash_mode;
 enum FlashModeTypeEnum rootfs_flash_mode;
@@ -349,7 +355,7 @@ int generate_boot_image(const char *kernelPath)
 
     if(strlen(board) >= BOOT_NAME_SIZE) {
         my_printf("error: board name too large\n");
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INVALID_INPUT;
     }
 
     strcpy((char *) hdr.name, board);
@@ -357,7 +363,7 @@ int generate_boot_image(const char *kernelPath)
     cmdlen = strlen(cmdline);
     if(cmdlen > (BOOT_ARGS_SIZE + BOOT_EXTRA_ARGS_SIZE - 2)) {
         my_printf("error: kernel commandline too large\n");
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INVALID_INPUT;
     }
     /* Even if we need to use the supplemental field, ensure we
      * are still NULL-terminated */
@@ -370,7 +376,7 @@ int generate_boot_image(const char *kernelPath)
     kernel_data = load_file(kernel_fn, &hdr.kernel_size);
     if(kernel_data == 0) {
         my_printf("error: could not load kernel '%s'\n", kernel_fn);
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INVALID_INPUT;
     }
         ramdisk_data = 0;
         hdr.ramdisk_size = 0;
@@ -379,7 +385,7 @@ int generate_boot_image(const char *kernelPath)
         second_data = load_file(second_fn, &hdr.second_size);
         if(second_data == 0) {
             my_printf("error: could not load secondstage '%s'\n", second_fn);
-            return EXIT_FAILURE;;
+            return OFG_EXIT_INVALID_INPUT;
         }
     }
     /* put a hash of the contents in the header so boot images can be
@@ -396,7 +402,7 @@ int generate_boot_image(const char *kernelPath)
 
     if (!mdctx) {
         my_printf("EVP_MD_CTX_new() failed.\n");
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INTEGRITY_FAIL;
     }
 
     // Specify the hash algorithm (SHA-1 in this case)
@@ -405,7 +411,7 @@ int generate_boot_image(const char *kernelPath)
     // Initialize the context with the chosen hash algorithm
     if (1 != EVP_DigestInit_ex(mdctx, md, NULL)) {
         my_printf("EVP_DigestInit_ex() failed.\n");
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INTEGRITY_FAIL;
     }
     // Update the hash context with your data
     // Assuming kernel_data, ramdisk_data, second_data, and hdr are properly defined
@@ -419,7 +425,7 @@ int generate_boot_image(const char *kernelPath)
     // Finalize the hash and obtain the result
     if (1 != EVP_DigestFinal_ex(mdctx, hash, NULL)) {
         my_printf("EVP_DigestFinal_ex() failed.\n");
-        return EXIT_FAILURE;;
+        return OFG_EXIT_INTEGRITY_FAIL;
     }
 
     // Copy the hash result to hdr.id
@@ -430,7 +436,7 @@ int generate_boot_image(const char *kernelPath)
         // If it exists, remove it
         if (remove(bootimg) != 0) {
             my_printf("Failed to delete existing %s\n", bootimg);
-           return EXIT_FAILURE;
+           return OFG_EXIT_WRITE_FAILURE;
         }
         my_printf("Existing %s removed.\n", bootimg);
     }
@@ -438,7 +444,7 @@ int generate_boot_image(const char *kernelPath)
     fd = open(bootimg, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if(fd < 0) {
         my_printf("error: could not create '%s'\n", bootimg);
-        return EXIT_FAILURE;;
+        return OFG_EXIT_WRITE_FAILURE;
     }
     if(write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) goto fail;
     if(write_padding(fd, pagesize, sizeof(hdr))) goto fail;
@@ -461,7 +467,7 @@ fail:
     unlink(bootimg);
     close(fd);
     my_printf("error: failed writing '%s'\n", bootimg);
-    return EXIT_FAILURE;;
+    return OFG_EXIT_WRITE_FAILURE;
 }
 
 void my_printf(char const *fmt, ...)
@@ -512,6 +518,11 @@ void printUsage()
 	my_printf("   -f --force             force kill e2\n");
 	my_printf("   -q --quiet             show less output\n");
 	my_printf("   -h --help              show help\n");
+	my_printf("   --allow-active-slot    allow flashing the currently running slot\n");
+	my_printf("   --target-slot=N        target slot number (alias for -mN)\n");
+	my_printf("   --inject-backup=PATH   copy backup tarball into target rootfs\n");
+	my_printf("   --inject-marker=PATH   copy restore marker JSON into target rootfs\n");
+	my_printf("   --keep-last=N          keep at most N backups in target rootfs\n");
 }
 
 char* ReadProcEntry(char *filename)
@@ -646,19 +657,26 @@ int read_args(int argc, char *argv[])
 	char *endptr;
 	long val;
 	static const char *short_options = "ac::k::r::ns:m:pfqh";
+	enum { OPT_ALLOW_ACTIVE = 256, OPT_TARGET_SLOT, OPT_INJECT_BACKUP,
+	       OPT_INJECT_MARKER, OPT_KEEP_LAST };
 	static const struct option long_options[] = {
-												{"android"      , no_argument, NULL, 'a'},
-												{"currentslot"  , optional_argument, NULL, 'c'},
-												{"kernel"       , optional_argument, NULL, 'k'},
-												{"rootfs"       , optional_argument, NULL, 'r'},
-												{"nowrite"      , no_argument      , NULL, 'n'},
-												{"slotname"     , required_argument, NULL, 's'},
-												{"multi"        , required_argument, NULL, 'm'},
-												{"pivot-only"   , no_argument      , NULL, 'p'},
-												{"force"        , no_argument      , NULL, 'f'},
-												{"quiet"        , no_argument      , NULL, 'q'},
-												{"help"         , no_argument      , NULL, 'h'},
-												{NULL           , no_argument      , NULL,  0} };
+												{"android"          , no_argument      , NULL, 'a'},
+												{"currentslot"      , optional_argument, NULL, 'c'},
+												{"kernel"           , optional_argument, NULL, 'k'},
+												{"rootfs"           , optional_argument, NULL, 'r'},
+												{"nowrite"          , no_argument      , NULL, 'n'},
+												{"slotname"         , required_argument, NULL, 's'},
+												{"multi"            , required_argument, NULL, 'm'},
+												{"pivot-only"       , no_argument      , NULL, 'p'},
+												{"force"            , no_argument      , NULL, 'f'},
+												{"quiet"            , no_argument      , NULL, 'q'},
+												{"help"             , no_argument      , NULL, 'h'},
+												{"allow-active-slot", no_argument      , NULL, OPT_ALLOW_ACTIVE},
+												{"target-slot"      , required_argument, NULL, OPT_TARGET_SLOT},
+												{"inject-backup"    , required_argument, NULL, OPT_INJECT_BACKUP},
+												{"inject-marker"    , required_argument, NULL, OPT_INJECT_MARKER},
+												{"keep-last"        , required_argument, NULL, OPT_KEEP_LAST},
+												{NULL               , no_argument      , NULL,  0} };
 
 	strcpy(slotname, "linuxrootfs");
 	currentslotcode = 1;
@@ -755,6 +773,54 @@ int read_args(int argc, char *argv[])
 				break;
 			case 'q':
 				quiet = 1;
+				break;
+			case OPT_ALLOW_ACTIVE:
+				allow_active_slot = 1;
+				my_printf("Active-slot flash explicitly allowed\n");
+				break;
+			case OPT_TARGET_SLOT:
+				if (optarg)
+				{
+					errno = 0;
+					val = strtol(optarg, &endptr, 10);
+					if (errno != 0 || endptr == optarg || val < 1)
+					{
+						my_printf("Error: --target-slot requires a positive integer\n");
+						show_help = 1;
+						return 0;
+					}
+					multiboot_partition = val;
+					my_printf("Target slot %d (multiboot partition)\n", multiboot_partition);
+				}
+				break;
+			case OPT_INJECT_BACKUP:
+				if (optarg)
+				{
+					strncpy(inject_backup_path, optarg, sizeof(inject_backup_path) - 1);
+					my_printf("Inject backup: %s\n", inject_backup_path);
+				}
+				break;
+			case OPT_INJECT_MARKER:
+				if (optarg)
+				{
+					strncpy(inject_marker_path, optarg, sizeof(inject_marker_path) - 1);
+					my_printf("Inject marker: %s\n", inject_marker_path);
+				}
+				break;
+			case OPT_KEEP_LAST:
+				if (optarg)
+				{
+					errno = 0;
+					val = strtol(optarg, &endptr, 10);
+					if (errno != 0 || endptr == optarg || val < 0)
+					{
+						my_printf("Error: --keep-last requires a non-negative integer\n");
+						show_help = 1;
+						return 0;
+					}
+					keep_last_n = val;
+					my_printf("Keep last %d backups\n", keep_last_n);
+				}
 				break;
 			case '?':
 				show_help = 1;
@@ -1500,7 +1566,7 @@ int umount_rootfs(int steps)
 	init_framebuffer(steps);
 	show_main_window(1, ofgwrite_version);
 	set_overall_text("Flashing image");
-	set_step_without_incr("Wait until E2 is stopped");
+	set_step_without_incr("Wait until " UI " is stopped");
 	sleep(2);
 
 	ret = pivot_root("/newroot/", "oldroot");
@@ -2088,13 +2154,13 @@ void readProcCmdline()
 			my_printf("Current multiboot partition: %d\n", multiboot_partition);
 			if (user_currentslotcode == 0) {
 				force_e2_stop = 1;
-				my_printf("Force E2 stop: ENABLED (default currentslot)\n");
+				my_printf("Force " UI " stop: ENABLED (default currentslot)\n");
 			} else if (currentslotcode == multiboot_partition) {
 				force_e2_stop = 1;
-				my_printf("Force E2 stop: ENABLED\n");
+				my_printf("Force " UI " stop: ENABLED\n");
 			} else {
 				force_e2_stop = 0;
-				my_printf("Force E2 stop: DISABLED\n");
+				my_printf("Force " UI " stop: DISABLED\n");
 			}
 		}
 
@@ -2336,6 +2402,204 @@ int check_device_size()
 	return 1;
 }
 
+/* Copy a backup tarball into the target rootfs.
+ * target_rootfs is the mount point (e.g. "/oldroot_remount" or
+ * "/oldroot_remount/linuxrootfs3").
+ * Returns 1 on success, 0 on failure.
+ */
+int inject_backup(const char *tarball, const char *target_rootfs)
+{
+	char dest_dir[1100];
+	char dest[1200];
+	char cmd[2400];
+	struct stat st;
+
+	if (stat(tarball, &st) != 0)
+	{
+		my_printf("inject-backup: source %s not found\n", tarball);
+		return 0;
+	}
+
+	snprintf(dest_dir, sizeof(dest_dir), "%s/var/lib/neutrino-backups", target_rootfs);
+	bb_make_directory(dest_dir, -1, FILEUTILS_RECUR);
+
+	/* Preserve the original filename from the source path */
+	const char *base = strrchr(tarball, '/');
+	base = base ? base + 1 : tarball;
+	snprintf(dest, sizeof(dest), "%s/%s", dest_dir, base);
+
+	/* Use cp to preserve the file (no shell metachar risk — paths are
+	 * validated by the caller and contain no user-controlled query
+	 * strings).  We avoid system() with concatenated paths as a
+	 * precaution and use a simple file copy loop instead.
+	 */
+	FILE *src = fopen(tarball, "rb");
+	if (!src)
+	{
+		my_printf("inject-backup: cannot open %s: %s\n", tarball, strerror(errno));
+		return 0;
+	}
+	FILE *dst = fopen(dest, "wb");
+	if (!dst)
+	{
+		my_printf("inject-backup: cannot create %s: %s\n", dest, strerror(errno));
+		fclose(src);
+		return 0;
+	}
+
+	char buf[65536];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+	{
+		if (fwrite(buf, 1, n, dst) != n)
+		{
+			my_printf("inject-backup: write error to %s: %s\n", dest, strerror(errno));
+			fclose(src);
+			fclose(dst);
+			return 0;
+		}
+	}
+	fclose(src);
+	if (fclose(dst) != 0)
+	{
+		my_printf("inject-backup: close error on %s: %s\n", dest, strerror(errno));
+		return 0;
+	}
+
+	my_printf("inject-backup: %s -> %s (%lld bytes)\n", tarball, dest, (long long)st.st_size);
+	return 1;
+}
+
+/* Copy a flash-restore marker JSON file into the target rootfs.
+ * Returns 1 on success, 0 on failure.
+ */
+int inject_marker(const char *marker_json, const char *target_rootfs)
+{
+	char dest_dir[1100];
+	char dest[1200];
+	struct stat st;
+
+	if (stat(marker_json, &st) != 0)
+	{
+		my_printf("inject-marker: source %s not found\n", marker_json);
+		return 0;
+	}
+
+	snprintf(dest_dir, sizeof(dest_dir), "%s/etc/neutrino", target_rootfs);
+	bb_make_directory(dest_dir, -1, FILEUTILS_RECUR);
+
+	snprintf(dest, sizeof(dest), "%s/flash-restore-pending.conf", dest_dir);
+
+	FILE *src = fopen(marker_json, "rb");
+	if (!src)
+	{
+		my_printf("inject-marker: cannot open %s: %s\n", marker_json, strerror(errno));
+		return 0;
+	}
+	FILE *dst = fopen(dest, "wb");
+	if (!dst)
+	{
+		my_printf("inject-marker: cannot create %s: %s\n", dest, strerror(errno));
+		fclose(src);
+		return 0;
+	}
+
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+	{
+		if (fwrite(buf, 1, n, dst) != n)
+		{
+			my_printf("inject-marker: write error to %s: %s\n", dest, strerror(errno));
+			fclose(src);
+			fclose(dst);
+			return 0;
+		}
+	}
+	fclose(src);
+	if (fclose(dst) != 0)
+	{
+		my_printf("inject-marker: close error on %s: %s\n", dest, strerror(errno));
+		return 0;
+	}
+
+	my_printf("inject-marker: %s -> %s\n", marker_json, dest);
+	return 1;
+}
+
+/* Prune old backups, keeping at most keep_n files in the backup
+ * directory under target_rootfs.  Files are sorted by name
+ * (pre-flash-<timestamp>.tar.gz) and oldest are removed first.
+ * Returns 1 on success, 0 on failure.
+ */
+int apply_keep_last(int keep_n, const char *target_rootfs)
+{
+	char backup_dir[1100];
+	DIR *dir;
+	struct dirent *entry;
+	char *names[256];  /* hard cap to avoid unbounded alloc */
+	int count = 0;
+
+	snprintf(backup_dir, sizeof(backup_dir), "%s/var/lib/neutrino-backups", target_rootfs);
+
+	dir = opendir(backup_dir);
+	if (!dir)
+	{
+		my_printf("keep-last: %s not found, nothing to prune\n", backup_dir);
+		return 1;  /* not an error — directory may not exist yet */
+	}
+
+	while ((entry = readdir(dir)) != NULL && count < 256)
+	{
+		if (entry->d_name[0] == '.')
+			continue;
+		/* Only prune pre-flash backup files */
+		if (strncmp(entry->d_name, "pre-flash-", 10) != 0)
+			continue;
+		names[count] = strdup(entry->d_name);
+		if (!names[count])
+			break;
+		count++;
+	}
+	closedir(dir);
+
+	if (count <= keep_n)
+	{
+		my_printf("keep-last: %d backups found, keep %d — nothing to prune\n", count, keep_n);
+		for (int i = 0; i < count; i++)
+			free(names[i]);
+		return 1;
+	}
+
+	/* Sort alphabetically (timestamp in name gives chronological order) */
+	for (int i = 0; i < count - 1; i++)
+		for (int j = i + 1; j < count; j++)
+			if (strcmp(names[i], names[j]) > 0)
+			{
+				char *tmp = names[i];
+				names[i] = names[j];
+				names[j] = tmp;
+			}
+
+	int to_remove = count - keep_n;
+	my_printf("keep-last: %d backups found, removing %d oldest\n", count, to_remove);
+
+	for (int i = 0; i < to_remove; i++)
+	{
+		char path[1300];
+		snprintf(path, sizeof(path), "%s/%s", backup_dir, names[i]);
+		if (unlink(path) == 0)
+			my_printf("keep-last: removed %s\n", names[i]);
+		else
+			my_printf("keep-last: failed to remove %s: %s\n", names[i], strerror(errno));
+	}
+
+	for (int i = 0; i < count; i++)
+		free(names[i]);
+
+	return 1;
+}
+
 void handle_busybox_fatal_error()
 {
 	my_printf("Error flashing rootfs! System won't boot. Please flash backup! System will reboot in 60 seconds\n");
@@ -2348,7 +2612,7 @@ void handle_busybox_fatal_error()
 	}
 	sleep(30);
 	close_framebuffer();
-	exit(EXIT_FAILURE);
+	exit(OFG_EXIT_WRITE_FAILURE);
 }
 
 int main(int argc, char *argv[])
@@ -2356,7 +2620,7 @@ int main(int argc, char *argv[])
 	// Check if running on a box or on a PC. Stop working on PC to prevent overwriting important files
 #if defined(__i386) || defined(__x86_64__)
 	my_printf("You're running ofgwrite on a PC. Aborting...\n");
-	exit(EXIT_FAILURE);
+	exit(OFG_EXIT_PREFLIGHT_FAIL);
 #endif
 
 	// Open log
@@ -2385,12 +2649,12 @@ int main(int argc, char *argv[])
 	if (!ret || show_help)
 	{
 		printUsage();
-		return EXIT_FAILURE;
+		return OFG_EXIT_INVALID_INPUT;
 	}
 
 	// set rootfs type and more
 	if (!readProcMounts())
-		return EXIT_FAILURE;
+		return OFG_EXIT_PREFLIGHT_FAIL;
 
 	// find kernel and rootfs devices
 	my_printf("\n");
@@ -2404,7 +2668,7 @@ int main(int argc, char *argv[])
 			my_printf(", because no kernel device was found\n");
 		else
 			my_printf(", because no kernel file was found\n");
-		return EXIT_FAILURE;
+		return OFG_EXIT_INVALID_INPUT;
 	}
 
 	if (flash_rootfs && (!found_rootfs_device || (rootfs_filename[0] == '\0' && nfi_filename[0] == '\0') || rootfs_type == UNKNOWN))
@@ -2416,11 +2680,20 @@ int main(int argc, char *argv[])
 			my_printf(", because no rootfs file was found\n");
 		else
 			my_printf(", because rootfs type is unknown\n");
-		return EXIT_FAILURE;
+		return OFG_EXIT_INVALID_INPUT;
+	}
+
+	// Active-slot policy: if target == current slot and --allow-active-slot
+	// was not given, refuse to flash.  This prevents accidental active-slot
+	// writes that would require a reboot mid-flash.
+	if (stop_e2_needed && !allow_active_slot && !no_write)
+	{
+		my_printf("Error: Target is the active slot. Use --allow-active-slot to proceed.\n");
+		return OFG_EXIT_ACTIVE_SLOT_BLOCKED;
 	}
 
 	if (!check_device_size())
-		return EXIT_FAILURE;
+		return OFG_EXIT_PREFLIGHT_FAIL;
 
 	my_printf("\n");
 
@@ -2434,21 +2707,21 @@ int main(int argc, char *argv[])
 		set_overall_text("Flashing kernel");
 
 		if (!kernel_flash(kernel_device, kernel_filename))
-			ret = EXIT_FAILURE;
+			ret = OFG_EXIT_WRITE_FAILURE;
 		else
-			ret = EXIT_SUCCESS;
+			ret = OFG_EXIT_SUCCESS;
 
-		if (!quiet && ret == EXIT_SUCCESS)
+		if (!quiet && ret == OFG_EXIT_SUCCESS)
 		{
 			my_printf("done\n");
 			set_step("Successfully flashed kernel!");
 			sleep(5);
 		}
-		else if (ret == EXIT_FAILURE)
+		else if (ret != OFG_EXIT_SUCCESS)
 		{
 			my_printf("failed. System won't boot. Please flash backup!\n");
 			set_error_text1("Error flashing kernel. System won't boot!");
-			set_error_text2("Please flash backup! Go back to E2 in 60 sec");
+			set_error_text2("Please flash backup! Go back to " UI " in 60 sec");
 			sleep(60);
 		}
 		closelog();
@@ -2465,7 +2738,7 @@ int main(int argc, char *argv[])
 		if (stop_e2_needed && !check_env())
 		{
 			closelog();
-			return EXIT_FAILURE;
+			return OFG_EXIT_PREFLIGHT_FAIL;
 		}
 
 		int steps = 6;
@@ -2524,13 +2797,13 @@ int main(int argc, char *argv[])
 			{
 				closelog();
 				close_framebuffer();
-				return EXIT_FAILURE;
+				return OFG_EXIT_PREFLIGHT_FAIL;
 			}
 			if (!umount_rootfs(steps))
 			{
 				closelog();
 				close_framebuffer();
-				return EXIT_FAILURE;
+				return OFG_EXIT_PREFLIGHT_FAIL;
 			}
 		}
 		// if not running rootfs is flashed then we need to mount it before start flashing.
@@ -2569,7 +2842,7 @@ int main(int argc, char *argv[])
 				set_error_text1("Error mounting root! Abort flashing.");
 				sleep(3);
 				close_framebuffer();
-				return EXIT_FAILURE;
+				return OFG_EXIT_PREFLIGHT_FAIL;
 			}
 		}
 
@@ -2593,9 +2866,53 @@ int main(int argc, char *argv[])
 			}
 			sleep(3);
 			close_framebuffer();
-			return EXIT_FAILURE;
+			return OFG_EXIT_WRITE_FAILURE;
 		}
 		my_printf("Successfully flashed rootfs!\n");
+
+		/* Pre-flash injection: backup tarball, restore marker,
+		 * and retention pruning.  Target rootfs is still mounted
+		 * at /oldroot_remount/ (with optional rootfs_sub_dir).
+		 */
+		if (!no_write && (inject_backup_path[0] != '\0'
+				|| inject_marker_path[0] != '\0'
+				|| keep_last_n >= 0))
+		{
+			char inject_root[1100];
+			if (rootfs_sub_dir[0] != '\0')
+				snprintf(inject_root, sizeof(inject_root),
+					"/oldroot_remount/%s", rootfs_sub_dir);
+			else
+				strcpy(inject_root, "/oldroot_remount");
+
+			if (inject_backup_path[0] != '\0')
+			{
+				if (!inject_backup(inject_backup_path, inject_root))
+				{
+					my_printf("Error: backup injection failed\n");
+					set_error_text1("Error injecting backup into target rootfs");
+					sleep(3);
+					close_framebuffer();
+					return OFG_EXIT_WRITE_FAILURE;
+				}
+			}
+			if (inject_marker_path[0] != '\0')
+			{
+				if (!inject_marker(inject_marker_path, inject_root))
+				{
+					my_printf("Error: marker injection failed\n");
+					set_error_text1("Error injecting restore marker");
+					sleep(3);
+					close_framebuffer();
+					return OFG_EXIT_WRITE_FAILURE;
+				}
+			}
+			if (keep_last_n >= 0)
+			{
+				apply_keep_last(keep_last_n, inject_root);
+			}
+			sync();
+		}
 
 		//Flash kernel
 		if (flash_kernel)
@@ -2605,9 +2922,9 @@ int main(int argc, char *argv[])
 
 			if (!kernel_flash(kernel_device, kernel_filename))
 			{
-				my_printf("Error flashing kernel. System won't boot. Please flash backup! Starting E2 in 60 seconds\n");
+				my_printf("Error flashing kernel. System won't boot. Please flash backup! Starting " UI " in 60 seconds\n");
 				set_error_text1("Error flashing kernel. System won't boot!");
-				set_error_text2("Please flash backup! Starting E2 in 60 sec");
+				set_error_text2("Please flash backup! Starting " UI " in 60 sec");
 				if (stop_e2_needed)
 				{
 					sleep(60);
@@ -2615,7 +2932,7 @@ int main(int argc, char *argv[])
 				}
 				sleep(3);
 				close_framebuffer();
-				return EXIT_FAILURE;
+				return OFG_EXIT_WRITE_FAILURE;
 			}
 			sync();
 			my_printf("Successfully flashed kernel!\n");
@@ -2668,14 +2985,14 @@ int main(int argc, char *argv[])
 					if (mount(dreamcard_device, dreamcard_mount, "vfat", 0, NULL) == -1) {
 						my_printf("Error: dreamcard device '%s' not mounted to '%s':%s.\n",dreamcard_device, dreamcard_mount, strerror(errno));
 						rmdir(dreamcard_mount);
-						return EXIT_FAILURE;
+						return OFG_EXIT_WRITE_FAILURE;
 					}
 					size_t length = strlen(rootfs_device);
 					int kernelnr = (length > 0) ? rootfs_device[length - 1] - '0' : -1;
 					if (kernelnr < 0 || kernelnr > 9) {
 						my_printf("Error: Invalid kernel number\n");
 						rmdir(dreamcard_mount);
-						return EXIT_FAILURE;
+						return OFG_EXIT_INVALID_INPUT;
 					}
 					char filename[50];
 					snprintf(filename, sizeof(filename), "/dreamcard/kernel%d.img", kernelnr);
@@ -2722,5 +3039,5 @@ int main(int argc, char *argv[])
 	closelog();
 	close_framebuffer();
 
-	return EXIT_SUCCESS;
+	return OFG_EXIT_SUCCESS;
 }
