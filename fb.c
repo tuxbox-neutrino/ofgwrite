@@ -11,6 +11,7 @@
 #include <errno.h>
 
 #include "font.h"
+#include "ofgwrite.h"
 
 #define TRANS "\x00\x00\x00\x00"
 #define BLACK "\x00\x00\x00\x80"
@@ -38,6 +39,32 @@ int g_step = 1;
 
 size_t g_fbMapLen = 0;
 int g_fbPages = 1;
+
+static char g_last_stage[128] = "";
+static int g_last_emit_percent = -1;
+static int g_last_emit_step = -1;
+
+void emit_machine_progress(int step, int total_steps, int percent,
+                           const char *stage)
+{
+	if (!machine_progress)
+		return;
+	if (percent < 0)
+		percent = 0;
+	if (percent > 100)
+		percent = 100;
+	/* Rate-limit: only emit on step change or percent delta >= 1. */
+	if (step == g_last_emit_step && percent == g_last_emit_percent)
+		return;
+	g_last_emit_step = step;
+	g_last_emit_percent = percent;
+	if (total_steps < 1)
+		total_steps = 1;
+	fprintf(stderr, "PROGRESS step=%d/%d percent=%d stage=%s\n",
+	        step, total_steps, percent,
+	        (stage && *stage) ? stage : "-");
+	fflush(stderr);
+}
 
 // box
 struct window_t
@@ -396,6 +423,8 @@ int set_fb_resolution()
 
 void set_step_progress(int percent)
 {
+	emit_machine_progress(g_step, g_pb_overall.steps, percent, g_last_stage);
+
 	if (g_fbFd == -1)
 		return;
 
@@ -567,8 +596,17 @@ void set_step_text(char* str)
 
 void set_step(char* str)
 {
+	if (str)
+		snprintf(g_last_stage, sizeof(g_last_stage), "%s", str);
+	/* Fresh step starts at 0% — reset throttle so that emit fires. */
+	g_last_emit_percent = -1;
+	emit_machine_progress(g_step, g_pb_overall.steps, 0, g_last_stage);
+
 	if (g_fbFd == -1)
+	{
+		g_step++;
 		return;
+	}
 
 	set_step_text(str);
 	set_overall_progress(g_step);
@@ -578,6 +616,11 @@ void set_step(char* str)
 
 void set_step_without_incr(char* str)
 {
+	if (str)
+		snprintf(g_last_stage, sizeof(g_last_stage), "%s", str);
+	g_last_emit_percent = -1;
+	emit_machine_progress(g_step, g_pb_overall.steps, 0, g_last_stage);
+
 	if (g_fbFd == -1)
 		return;
 

@@ -56,7 +56,7 @@ extern enum ImageTypeEnum image_type;
 void my_printf(const char *format, ...);
 void my_fprintf(FILE* stream, const char *format, ...);
 
-int set_step(char*);
+void set_step(char*);
 void set_step_without_incr(char* str);
 void set_step_progress(int percent);
 void set_overall_progress(int step);
@@ -93,6 +93,12 @@ extern int allow_active_slot;
 extern char inject_backup_path[1000];
 extern char inject_marker_path[1000];
 extern int keep_last_n;
+extern int machine_progress;
+
+/* Emit machine-readable progress line on stderr when --machine-progress is
+   active. Format: "PROGRESS step=N/M percent=P stage=<name>" */
+void emit_machine_progress(int step, int total_steps, int percent,
+                           const char *stage);
 
 int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int quiet, int no_write);
 int flash_unpack_rootfs(char* filename, int quiet, int no_write);

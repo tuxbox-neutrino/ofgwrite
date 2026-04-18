@@ -92,6 +92,7 @@ int allow_active_slot = 0;
 char inject_backup_path[1000] = "";
 char inject_marker_path[1000] = "";
 int keep_last_n = -1;  /* -1 = disabled */
+int machine_progress = 0;
 
 enum FlashModeTypeEnum kernel_flash_mode;
 enum FlashModeTypeEnum rootfs_flash_mode;
@@ -523,6 +524,7 @@ void printUsage()
 	my_printf("   --inject-backup=PATH   copy backup tarball into target rootfs\n");
 	my_printf("   --inject-marker=PATH   copy restore marker JSON into target rootfs\n");
 	my_printf("   --keep-last=N          keep at most N backups in target rootfs\n");
+	my_printf("   --machine-progress     emit machine-readable progress on stderr\n");
 }
 
 char* ReadProcEntry(char *filename)
@@ -658,7 +660,7 @@ int read_args(int argc, char *argv[])
 	long val;
 	static const char *short_options = "ac::k::r::ns:m:pfqh";
 	enum { OPT_ALLOW_ACTIVE = 256, OPT_TARGET_SLOT, OPT_INJECT_BACKUP,
-	       OPT_INJECT_MARKER, OPT_KEEP_LAST };
+	       OPT_INJECT_MARKER, OPT_KEEP_LAST, OPT_MACHINE_PROGRESS };
 	static const struct option long_options[] = {
 												{"android"          , no_argument      , NULL, 'a'},
 												{"currentslot"      , optional_argument, NULL, 'c'},
@@ -676,6 +678,7 @@ int read_args(int argc, char *argv[])
 												{"inject-backup"    , required_argument, NULL, OPT_INJECT_BACKUP},
 												{"inject-marker"    , required_argument, NULL, OPT_INJECT_MARKER},
 												{"keep-last"        , required_argument, NULL, OPT_KEEP_LAST},
+												{"machine-progress" , no_argument      , NULL, OPT_MACHINE_PROGRESS},
 												{NULL               , no_argument      , NULL,  0} };
 
 	strcpy(slotname, "linuxrootfs");
@@ -821,6 +824,9 @@ int read_args(int argc, char *argv[])
 					keep_last_n = val;
 					my_printf("Keep last %d backups\n", keep_last_n);
 				}
+				break;
+			case OPT_MACHINE_PROGRESS:
+				machine_progress = 1;
 				break;
 			case '?':
 				show_help = 1;
@@ -3038,6 +3044,12 @@ int main(int argc, char *argv[])
 
 	closelog();
 	close_framebuffer();
+
+	if (machine_progress)
+	{
+		fprintf(stderr, "PROGRESS done\n");
+		fflush(stderr);
+	}
 
 	return OFG_EXIT_SUCCESS;
 }
