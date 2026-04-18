@@ -1219,6 +1219,37 @@ int readProcMounts()
 	return 1;
 }
 
+/* Move our own PID out of the current systemd cgroup(s) into the root cgroup,
+ * so that a subsequent `systemctl stop neutrino` (which uses KillMode=control-
+ * group by default) does not send SIGTERM to us. Safe to call repeatedly and
+ * on systems without cgroups — all failures are ignored.
+ *
+ * Handles both hybrid (v1 name=systemd + v2 unified) and pure v2 layouts. */
+static void escape_systemd_cgroup()
+{
+	static const char *procs_paths[] = {
+		"/sys/fs/cgroup/systemd/cgroup.procs", /* hybrid v1 name=systemd */
+		"/sys/fs/cgroup/unified/cgroup.procs", /* hybrid v2 unified     */
+		"/sys/fs/cgroup/cgroup.procs",         /* pure v2               */
+		NULL
+	};
+	char pid_str[32];
+	int n = snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+	if (n <= 0)
+		return;
+
+	for (const char **p = procs_paths; *p; ++p)
+	{
+		int fd = open(*p, O_WRONLY);
+		if (fd < 0)
+			continue;
+		ssize_t w = write(fd, pid_str, (size_t)n);
+		(void)w;
+		close(fd);
+	}
+	my_printf("cgroup escape attempted (pid %d)\n", (int)getpid());
+}
+
 enum InitSystemEnum detect_init_system()
 {
 	FILE *f = fopen("/proc/1/comm", "r");
@@ -1531,6 +1562,12 @@ int umount_rootfs(int steps)
 	enum InitSystemEnum init_sys = detect_init_system();
 	if (init_sys == INIT_SYSTEMD)
 	{
+		// If we were spawned inside the GUI's own systemd cgroup (e.g.
+		// Neutrino's flash_manager calling us via system()), then
+		// `systemctl stop neutrino` would SIGTERM everything in that
+		// cgroup — including us — before pivot_root can run. Escape to
+		// the root cgroup first so we survive.
+		escape_systemd_cgroup();
 		my_printf("Stopping GUI service (systemd)\n");
 		// First, explicitly stop known GUI services synchronously.
 		// systemctl stop blocks until the service is actually stopped.
