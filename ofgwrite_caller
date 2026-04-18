@@ -4,6 +4,21 @@ set -eu
 BACKEND_SCRIPT="${OFGWRITE_BACKEND_SCRIPT:-/usr/libexec/tuxbox/flash-backend-ofgwrite.sh}"
 OFGWRITE_BIN="${OFGWRITE_BIN:-ofgwrite}"
 
+# When invoked from a GUI process (e.g. Neutrino's flash manager), we start
+# out in the GUI's systemd cgroup. The backend will later run
+# `systemctl stop neutrino` which (via KillMode=control-group) sends SIGTERM
+# to every process in that cgroup — including us, before ofgwrite can even
+# start its pivot_root. Move this shell (and therefore every child it
+# spawns) into the root systemd cgroup as the very first step. Best-effort:
+# failures are ignored so this stays a no-op on systems without cgroups.
+for procs in \
+	/sys/fs/cgroup/systemd/cgroup.procs \
+	/sys/fs/cgroup/unified/cgroup.procs \
+	/sys/fs/cgroup/cgroup.procs; do
+	[ -w "${procs}" ] || continue
+	echo $$ > "${procs}" 2>/dev/null || true
+done
+
 usage() {
 	cat <<'EOF'
 Usage: ofgwrite_caller <update-dir> <update-package> [ofgwrite-options]
