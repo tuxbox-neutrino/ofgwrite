@@ -100,8 +100,16 @@ extern int machine_progress;
 void emit_machine_progress(int step, int total_steps, int percent,
                            const char *stage);
 
+/* Persistent diagnostic log: writes to /dev/kmsg AND
+ * /oldroot_remount/ofgwrite-trace.log (userdata top-level, survives reboot
+ * and rootfs-wipe). Implemented in flash_ext4.c. */
+void flash_diag_log(const char *fmt, ...);
+
 int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int quiet, int no_write);
 int flash_unpack_rootfs(char* filename, int quiet, int no_write);
+/* After kernel_flash succeeds, caller invokes this to finally delete the
+ * retained old rootfs backup (e.g. linuxrootfsN.old). See flash_ext4.c. */
+void flash_unpack_rootfs_cleanup_backup(void);
 int flash_ubi_jffs2_kernel(char* device, char* filename, int quiet, int no_write);
 int flash_ubi_jffs2_rootfs(char* device, char* filename, enum RootfsTypeEnum rootfs_type, int quiet, int no_write);
 int flash_erase_main(int argc, char **argv);

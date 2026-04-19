@@ -1074,8 +1074,80 @@ int read_mtd_file()
 	return 1;
 }
 
+/* Dump a rich pre-flash diagnostic snapshot to kmsg AND the persistent
+ * trace file on the userdata partition. Captures everything we need to
+ * diagnose why kernel_flash might see a missing/unreadable source file
+ * after pivot_root: filename stat, parent dir listing, and mount state. */
+static void kflash_log_mount_snapshot(const char *label, const char *filename,
+				      const char *device)
+{
+	flash_diag_log("%s: filename=%s device=%s\n", label, filename, device);
+
+	struct stat st;
+	if (filename && filename[0])
+	{
+		if (stat(filename, &st) == 0)
+			flash_diag_log("  src stat: size=%lld mode=0%o\n",
+				(long long)st.st_size, (unsigned)st.st_mode);
+		else
+			flash_diag_log("  src stat: FAILED errno=%d (%s)\n",
+				errno, strerror(errno));
+	}
+	if (device && device[0])
+	{
+		if (stat(device, &st) == 0)
+			flash_diag_log("  dev stat: mode=0%o rdev=%u\n",
+				(unsigned)st.st_mode, (unsigned)st.st_rdev);
+		else
+			flash_diag_log("  dev stat: FAILED errno=%d (%s)\n",
+				errno, strerror(errno));
+	}
+
+	if (filename && filename[0])
+	{
+		char dirbuf[1000];
+		snprintf(dirbuf, sizeof(dirbuf), "%s", filename);
+		char *slash = strrchr(dirbuf, '/');
+		if (slash)
+		{
+			*slash = '\0';
+			const char *parent = dirbuf[0] ? dirbuf : "/";
+			DIR *d = opendir(parent);
+			if (d)
+			{
+				flash_diag_log("  parent %s listing:\n", parent);
+				struct dirent *e;
+				while ((e = readdir(d)))
+					flash_diag_log("    %s\n", e->d_name);
+				closedir(d);
+			}
+			else
+			{
+				flash_diag_log("  parent %s opendir FAILED errno=%d (%s)\n",
+					parent, errno, strerror(errno));
+			}
+		}
+	}
+
+	FILE *m = fopen("/proc/self/mounts", "r");
+	if (m)
+	{
+		char line[512];
+		flash_diag_log("  mounts begin\n");
+		while (fgets(line, sizeof(line), m))
+		{
+			size_t n = strlen(line);
+			if (n && line[n-1] == '\n') line[n-1] = '\0';
+			flash_diag_log("    %s\n", line);
+		}
+		flash_diag_log("  mounts end\n");
+		fclose(m);
+	}
+}
+
 int kernel_flash(char* device, char* filename)
 {
+	kflash_log_mount_snapshot("pre-kernel-flash", filename, device);
 	if (kernel_flash_mode == TARBZ2)
 		return flash_ext4_kernel(device, filename, kernel_file_stat.st_size, quiet, no_write);
 	else if (kernel_flash_mode == MTD)
@@ -2979,6 +3051,12 @@ int main(int argc, char *argv[])
 			}
 			sync();
 			my_printf("Successfully flashed kernel!\n");
+			/* Kernel flash succeeded. Now safe to delete the retained
+			 * old rootfs backup (linuxrootfsN.old). Before this point
+			 * the backup holds the image files still referenced via
+			 * the /media/ bind mount; deleting earlier would ENOENT
+			 * kernel_flash's source. */
+			flash_unpack_rootfs_cleanup_backup();
 		}
 
 		//Android boot kernel.img Dreambox one/two

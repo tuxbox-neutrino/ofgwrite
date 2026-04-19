@@ -1,11 +1,67 @@
 #include "ofgwrite.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <getopt.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
+
+/* Persistent trace on userdata partition top-level (outside any linuxrootfsN/
+ * subdir). Survives reboot AND rootfs-wipe. Read back after reboot via:
+ *   debugfs -R "dump /ofgwrite-trace.log /tmp/trace.log" /dev/mmcblk0p23
+ * fopen fails silently if /oldroot_remount is not mounted yet. */
+void flash_diag_log(const char *fmt, ...)
+{
+	FILE *km = fopen("/dev/kmsg", "w");
+	FILE *tf = fopen("/oldroot_remount/ofgwrite-trace.log", "a");
+	va_list ap;
+
+	if (km)
+	{
+		va_start(ap, fmt);
+		fprintf(km, "<4>ofgwrite: ");
+		vfprintf(km, fmt, ap);
+		va_end(ap);
+		fclose(km);
+	}
+	if (tf)
+	{
+		time_t now = time(NULL);
+		struct tm tm;
+		gmtime_r(&now, &tm);
+		fprintf(tf, "%04d-%02d-%02dT%02d:%02d:%02dZ ",
+			tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+			tm.tm_hour, tm.tm_min, tm.tm_sec);
+		va_start(ap, fmt);
+		vfprintf(tf, fmt, ap);
+		va_end(ap);
+		fflush(tf);
+		fsync(fileno(tf));
+		fclose(tf);
+	}
+}
+
+#define kmsg_log flash_diag_log
+
+/* Backup path retained by flash_unpack_rootfs() for deletion after
+ * kernel_flash completes. See comment in flash_unpack_rootfs(). */
+static char pending_backup_path[1000] = "";
+
+void flash_unpack_rootfs_cleanup_backup(void)
+{
+	if (pending_backup_path[0] == '\0')
+		return;
+	flash_diag_log("rootfs: deferred cleanup of backup %s\n",
+		pending_backup_path);
+	rm_rootfs(pending_backup_path, 1, 0);
+	rmdir(pending_backup_path);
+	pending_backup_path[0] = '\0';
+	sync();
+}
 
 static void log_extract_target_space(const char* filename, const char* directory)
 {
@@ -38,12 +94,30 @@ int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int 
 {
 	char buffer[512];
 
+	// Preflight: stat source and device so we can distinguish missing-path
+	// from permission/other errors in the kernel ring buffer.
+	struct stat src_st, dev_st;
+	int src_stat_rc = stat(filename, &src_st);
+	int src_stat_err = errno;
+	int dev_stat_rc = stat(device, &dev_st);
+	int dev_stat_err = errno;
+	kmsg_log("kernel_flash preflight: src=%s stat_rc=%d err=%s "
+		"size=%lld dev=%s stat_rc=%d err=%s\n",
+		filename, src_stat_rc,
+		src_stat_rc == 0 ? "ok" : strerror(src_stat_err),
+		src_stat_rc == 0 ? (long long)src_st.st_size : -1LL,
+		device, dev_stat_rc,
+		dev_stat_rc == 0 ? "ok" : strerror(dev_stat_err));
+
 	// Open kernel file
 	FILE* kernel_file;
 	kernel_file = fopen(filename, "rb");
 	if (kernel_file == NULL)
 	{
-		my_printf("Error while opening kernel file %s\n", filename);
+		int e = errno;
+		my_printf("Error while opening kernel file %s: %s\n", filename, strerror(e));
+		kmsg_log("kernel_flash: fopen source FAILED path=%s errno=%d (%s)\n",
+			filename, e, strerror(e));
 		return 0;
 	}
 
@@ -52,7 +126,11 @@ int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int 
 	kernel_dev = fopen(device, "wb");
 	if (kernel_dev == NULL)
 	{
-		my_printf("Error while opening kernel device %s\n", device);
+		int e = errno;
+		my_printf("Error while opening kernel device %s: %s\n", device, strerror(e));
+		kmsg_log("kernel_flash: fopen device FAILED path=%s errno=%d (%s)\n",
+			device, e, strerror(e));
+		fclose(kernel_file);
 		return 0;
 	}
 
@@ -69,7 +147,10 @@ int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int 
 		{
 			if (feof(kernel_file))
 				continue;
-			my_printf("Error reading kernel file.\n");
+			int e = errno;
+			my_printf("Error reading kernel file: %s\n", strerror(e));
+			kmsg_log("kernel_flash: fread FAILED after %lld bytes errno=%d (%s)\n",
+				readBytes, e, strerror(e));
 			fclose(kernel_file);
 			fclose(kernel_dev);
 			return 0;
@@ -86,7 +167,10 @@ int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int 
 			ret = fwrite(buffer, ret, 1, kernel_dev);
 			if (ret != 1)
 			{
-				my_printf("Error writing kernel file to kernel device.\n");
+				int e = errno;
+				my_printf("Error writing kernel file to kernel device: %s\n", strerror(e));
+				kmsg_log("kernel_flash: fwrite FAILED after %lld bytes errno=%d (%s)\n",
+					readBytes, e, strerror(e));
 				fclose(kernel_file);
 				fclose(kernel_dev);
 				return 0;
@@ -97,6 +181,8 @@ int flash_ext4_kernel(char* device, char* filename, off_t kernel_file_size, int 
 	fclose(kernel_file);
 	fclose(kernel_dev);
 
+	kmsg_log("kernel_flash: success path=%s bytes=%lld device=%s\n",
+		filename, readBytes, device);
 	return 1;
 }
 
@@ -243,13 +329,20 @@ int flash_unpack_rootfs(char* filename, int quiet, int no_write)
 		return 0;
 	}
 
-	// Success: delete old backup
+	// Success: DEFER backup deletion until after kernel_flash.
+	// The image files (uImage, rootfs.tar.bz2) live inside the backup
+	// (e.g. /oldroot_remount/linuxrootfs4.old/media/hdd/ofgwrite-caller-XXXX/)
+	// and are still referenced via the /media/ bind mount. Deleting the
+	// backup here would unlink the kernel source before kernel_flash() can
+	// read it, causing ENOENT. The caller invokes
+	// flash_unpack_rootfs_cleanup_backup() once kernel_flash succeeds.
 	if (has_backup)
 	{
-		set_step("Cleaning up old rootfs");
-		my_printf("Removing old rootfs backup %s\n", backup_path);
-		rm_rootfs(backup_path, quiet, 0);
-		rmdir(backup_path);
+		strncpy(pending_backup_path, backup_path,
+			sizeof(pending_backup_path) - 1);
+		pending_backup_path[sizeof(pending_backup_path) - 1] = '\0';
+		flash_diag_log("rootfs: backup retained for post-kernel-flash cleanup: %s\n",
+			pending_backup_path);
 	}
 
 	// sync filesystem double because of sdcard
