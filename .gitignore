@@ -2,3 +2,7 @@
 *.a
 ofgwrite_bin
 build
+
+# used by bitbake within workspace
+oe-logs
+oe-workdir
