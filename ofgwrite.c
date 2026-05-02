@@ -87,6 +87,18 @@ char ubi_fs_name[1000];
 char ubi_loop_device[1000];
 int loop_mtd_device = 99999;
 char profile_conf_path[1000] = "/etc/tuxbox/flash-machine-profile.conf";
+static int profile_loaded = 0;
+static int profile_present = 0;
+static int profile_ofgwrite_unsupported = 0;
+static char profile_kernel_device[256] = "";
+static char profile_rootfs_device[256] = "";
+static char profile_kernel_file[256] = "";
+static char profile_rootfs_file[256] = "";
+static char profile_rootfs_subdir_prefix[256] = "";
+static char profile_kernel_label_prefix[256] = "";
+static char profile_rootfs_label_prefix[256] = "";
+static char profile_rootfs_shared_label[256] = "";
+static char profile_active_slot_source[256] = "";
 
 int allow_active_slot = 0;
 char inject_backup_path[1000] = "";
@@ -130,6 +142,126 @@ struct struct_mountlist
 
 
 static unsigned char padding[16384] = { 0, };
+
+static void copy_string(char *dst, size_t dst_size, const char *src)
+{
+	if (dst_size == 0)
+		return;
+	if (src == NULL)
+		src = "";
+	strncpy(dst, src, dst_size - 1);
+	dst[dst_size - 1] = '\0';
+}
+
+static void profile_trim(char *s)
+{
+	char *start = s;
+	char *end;
+
+	while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')
+		start++;
+	if (start != s)
+		memmove(s, start, strlen(start) + 1);
+
+	end = s + strlen(s);
+	while (end > s && (end[-1] == ' ' || end[-1] == '\t'
+		|| end[-1] == '\r' || end[-1] == '\n'))
+		*--end = '\0';
+}
+
+static int parse_profile_line(char *line, char *key, size_t key_size,
+			      char *value, size_t value_size)
+{
+	char *hash;
+	char *eq;
+	char *v;
+	size_t len;
+
+	hash = strchr(line, '#');
+	if (hash != NULL)
+		*hash = '\0';
+	eq = strchr(line, '=');
+	if (eq == NULL)
+		return 0;
+	*eq = '\0';
+
+	copy_string(key, key_size, line);
+	profile_trim(key);
+	v = eq + 1;
+	profile_trim(v);
+
+	len = strlen(v);
+	if (len >= 2 && v[0] == '"' && v[len - 1] == '"')
+	{
+		v[len - 1] = '\0';
+		v++;
+	}
+	copy_string(value, value_size, v);
+	return key[0] != '\0';
+}
+
+static void load_profile_conf(void)
+{
+	FILE *f;
+	char line[512];
+	char key[256];
+	char value[256];
+
+	if (profile_loaded)
+		return;
+	profile_loaded = 1;
+
+	f = fopen(profile_conf_path, "r");
+	if (f == NULL)
+	{
+		my_printf("Profile config %s not found\n", profile_conf_path);
+		return;
+	}
+
+	profile_present = 1;
+	my_printf("Reading profile config: %s\n", profile_conf_path);
+
+	while (fgets(line, sizeof(line), f) != NULL)
+	{
+		if (!parse_profile_line(line, key, sizeof(key), value, sizeof(value)))
+			continue;
+
+		if (strcmp(key, "FLASH_MACHINE_CAP_OFGWRITE") == 0
+			&& strcmp(value, "1") != 0)
+			profile_ofgwrite_unsupported = 1;
+		else if (strcmp(key, "FLASH_MTD_KERNEL") == 0)
+			copy_string(profile_kernel_device, sizeof(profile_kernel_device), value);
+		else if (strcmp(key, "FLASH_MTD_ROOTFS") == 0)
+			copy_string(profile_rootfs_device, sizeof(profile_rootfs_device), value);
+		else if (strcmp(key, "FLASH_KERNEL_FILE") == 0)
+			copy_string(profile_kernel_file, sizeof(profile_kernel_file), value);
+		else if (strcmp(key, "FLASH_ROOTFS_FILE") == 0)
+			copy_string(profile_rootfs_file, sizeof(profile_rootfs_file), value);
+		else if (strcmp(key, "FLASH_ROOTFS_SUBDIR_PREFIX") == 0)
+			copy_string(profile_rootfs_subdir_prefix, sizeof(profile_rootfs_subdir_prefix), value);
+		else if (strcmp(key, "FLASH_SLOT_KERNEL_LABEL_PREFIX") == 0)
+			copy_string(profile_kernel_label_prefix, sizeof(profile_kernel_label_prefix), value);
+		else if (strcmp(key, "FLASH_SLOT_ROOTFS_LABEL_PREFIX") == 0)
+			copy_string(profile_rootfs_label_prefix, sizeof(profile_rootfs_label_prefix), value);
+		else if (strcmp(key, "FLASH_SLOT_ROOTFS_SHARED_LABEL") == 0)
+			copy_string(profile_rootfs_shared_label, sizeof(profile_rootfs_shared_label), value);
+		else if (strcmp(key, "FLASH_ACTIVE_SLOT_SOURCE") == 0)
+			copy_string(profile_active_slot_source, sizeof(profile_active_slot_source), value);
+	}
+	fclose(f);
+
+	if (profile_rootfs_subdir_prefix[0] == '\0')
+		copy_string(profile_rootfs_subdir_prefix, sizeof(profile_rootfs_subdir_prefix), "linuxrootfs");
+	if (profile_kernel_label_prefix[0] == '\0')
+		copy_string(profile_kernel_label_prefix, sizeof(profile_kernel_label_prefix), "linuxkernel");
+	if (profile_rootfs_label_prefix[0] == '\0')
+		copy_string(profile_rootfs_label_prefix, sizeof(profile_rootfs_label_prefix), "linuxrootfs");
+	if (profile_rootfs_shared_label[0] == '\0')
+		copy_string(profile_rootfs_shared_label, sizeof(profile_rootfs_shared_label), "userdata");
+
+	if (!user_slotname && profile_rootfs_subdir_prefix[0] != '\0')
+		copy_string(slotname, sizeof(slotname), profile_rootfs_subdir_prefix);
+}
 
 static void set_root_mount_private(void)
 {
@@ -598,7 +730,10 @@ int find_image_files(char* p)
 		entry = readdir(d);
 		if (entry)
 		{
-			if ((strstr(entry->d_name, "kernel") != NULL
+			size_t name_len = strlen(entry->d_name);
+			if ((profile_kernel_file[0] != '\0'
+				&& strcmp(entry->d_name, profile_kernel_file) == 0)
+			 || (strstr(entry->d_name, "kernel") != NULL
 			  && strstr(entry->d_name, ".bin")   != NULL)			// ET-xx00, XP1000, VU boxes, DAGS boxes
 			 || strcmp(entry->d_name, "uImage") == 0)				// Spark boxes
 			{
@@ -607,7 +742,9 @@ int find_image_files(char* p)
 				stat(kernel_filename, &kernel_file_stat);
 				my_printf("Found kernel file: %s\n", kernel_filename);
 			}
-			if (strcmp(entry->d_name, "rootfs.bin") == 0			// ET-xx00, XP1000
+			if ((profile_rootfs_file[0] != '\0'
+				&& strcmp(entry->d_name, profile_rootfs_file) == 0)
+			 || strcmp(entry->d_name, "rootfs.bin") == 0			// ET-xx00, XP1000
 			 || strcmp(entry->d_name, "root_cfe_auto.bin") == 0		// Solo2
 			 || strcmp(entry->d_name, "root_cfe_auto.jffs2") == 0	// other VU boxes
 			 || strcmp(entry->d_name, "oe_rootfs.bin") == 0			// DAGS boxes
@@ -627,7 +764,7 @@ int find_image_files(char* p)
 				else
 					image_type = UBI;
 			}
-			if (strcmp(&entry->d_name[strlen(entry->d_name)-4], ".nfi") == 0) // dream nfi
+			if (name_len >= 4 && strcmp(&entry->d_name[name_len - 4], ".nfi") == 0) // dream nfi
 			{
 				strcpy(nfi_filename, path);
 				strcat(nfi_filename, entry->d_name);
@@ -636,7 +773,7 @@ int find_image_files(char* p)
 				strcpy(nfi_path, path);
 				image_type = UBI;
 			}
-			if (strcmp(&entry->d_name[strlen(entry->d_name)-7], ".tar.xz") == 0) // dream dm520
+			if (name_len >= 7 && strcmp(&entry->d_name[name_len - 7], ".tar.xz") == 0) // dream dm520
 			{
 				strcpy(rootfs_filename, path);
 				strcat(rootfs_filename, entry->d_name);
@@ -690,6 +827,7 @@ int read_args(int argc, char *argv[])
 	user_currentslotcode = 0;
 	android = 0;
 	rootsubdir_check = 0;
+	load_profile_conf();
 
 	while ((opt= getopt_long(argc, argv, short_options, long_options, &option_index)) != -1)
 	{
@@ -1974,46 +2112,33 @@ static int parse_dev_partition_nr(const char* dev, int* prefix_len)
  */
 int detect_via_profile_conf(void)
 {
-	FILE* f;
-	char line[512];
-	char key[256];
-	char value[256];
-	char mtd_kernel[256] = "";
-	char mtd_rootfs[256] = "";
 	int slot;
 
-	f = fopen(profile_conf_path, "r");
-	if (f == NULL)
+	load_profile_conf();
+
+	if (!profile_present)
 	{
 		my_printf("Profile config %s not found\n", profile_conf_path);
 		return 0;
 	}
 
-	my_printf("Reading profile config: %s\n", profile_conf_path);
-
-	while (fgets(line, sizeof(line), f) != NULL)
+	if (profile_ofgwrite_unsupported)
 	{
-		// Parse KEY="VALUE" lines
-		if (sscanf(line, "%255[^=]=\"%255[^\"]\"", key, value) == 2)
-		{
-			if (strcmp(key, "FLASH_MTD_KERNEL") == 0)
-				strncpy(mtd_kernel, value, sizeof(mtd_kernel) - 1);
-			else if (strcmp(key, "FLASH_MTD_ROOTFS") == 0)
-				strncpy(mtd_rootfs, value, sizeof(mtd_rootfs) - 1);
-		}
+		my_printf("Profile config: FLASH_MACHINE_CAP_OFGWRITE is not enabled\n");
+		return 0;
 	}
-	fclose(f);
 
-	if (mtd_kernel[0] == '\0' || mtd_rootfs[0] == '\0')
+	if (profile_kernel_device[0] == '\0' || profile_rootfs_device[0] == '\0')
 	{
 		my_printf("Profile config: FLASH_MTD_KERNEL or FLASH_MTD_ROOTFS missing\n");
 		return 0;
 	}
 
-	my_printf("Profile config: base kernel=%s rootfs=%s\n", mtd_kernel, mtd_rootfs);
+	my_printf("Profile config: base kernel=%s rootfs=%s subdir-prefix=%s\n",
+		profile_kernel_device, profile_rootfs_device, slotname);
 
 	// Determine flash mode from device name prefix
-	if (strncmp(mtd_kernel, "mtd", 3) == 0)
+	if (strncmp(profile_kernel_device, "mtd", 3) == 0)
 	{
 		kernel_flash_mode = MTD;
 		rootfs_flash_mode = MTD;
@@ -2031,27 +2156,27 @@ int detect_via_profile_conf(void)
 		// eMMC multiboot: kernel partitions are sequential
 		// e.g. slot1=mmcblk0p19, slot2=mmcblk0p20, ...
 		int prefix_len = 0;
-		int base_nr = parse_dev_partition_nr(mtd_kernel, &prefix_len);
+		int base_nr = parse_dev_partition_nr(profile_kernel_device, &prefix_len);
 		if (base_nr >= 0)
 		{
 			int target_nr = base_nr + (slot - 1);
 			char dev_base[256];
-			strncpy(dev_base, mtd_kernel, prefix_len);
+			strncpy(dev_base, profile_kernel_device, prefix_len);
 			dev_base[prefix_len] = '\0';
 			sprintf(kernel_device, "/dev/%s%d", dev_base, target_nr);
 		}
 		else
 		{
-			sprintf(kernel_device, "/dev/%s", mtd_kernel);
+			sprintf(kernel_device, "/dev/%s", profile_kernel_device);
 		}
 	}
 	else
 	{
-		sprintf(kernel_device, "/dev/%s", mtd_kernel);
+		sprintf(kernel_device, "/dev/%s", profile_kernel_device);
 	}
 
 	// Rootfs device (stays the same for all slots on userdata partition)
-	sprintf(rootfs_device, "/dev/%s", mtd_rootfs);
+	sprintf(rootfs_device, "/dev/%s", profile_rootfs_device);
 
 	// Set rootfs subdirectory for multiboot
 	if ((current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
@@ -2099,12 +2224,12 @@ int detect_via_partlabel(void)
 	slot = (multiboot_partition > 0) ? multiboot_partition : 1;
 
 	// Build expected label names for this slot
-	// Try linuxkernel{N} first (HD60 style), then kernel{N}
+	// Try profile-defined labels first, then legacy fallbacks.
 	char try_kernel_labels[4][64];
 	int n_kernel_labels = 0;
-	sprintf(try_kernel_labels[n_kernel_labels++], "linuxkernel%d", slot);
+	snprintf(try_kernel_labels[n_kernel_labels++], sizeof(try_kernel_labels[0]), "%s%d", profile_kernel_label_prefix, slot);
 	if (slot == 1)
-		sprintf(try_kernel_labels[n_kernel_labels++], "linuxkernel");
+		snprintf(try_kernel_labels[n_kernel_labels++], sizeof(try_kernel_labels[0]), "%s", profile_kernel_label_prefix);
 	sprintf(try_kernel_labels[n_kernel_labels++], "kernel%d", slot);
 	if (slot == 1)
 		sprintf(try_kernel_labels[n_kernel_labels++], "kernel");
@@ -2115,11 +2240,11 @@ int detect_via_partlabel(void)
 	int n_rootfs_labels = 0;
 	if (current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
 	{
-		sprintf(try_rootfs_labels[n_rootfs_labels++], "userdata");
+		snprintf(try_rootfs_labels[n_rootfs_labels++], sizeof(try_rootfs_labels[0]), "%s", profile_rootfs_shared_label);
 	}
-	sprintf(try_rootfs_labels[n_rootfs_labels++], "linuxrootfs%d", slot);
+	snprintf(try_rootfs_labels[n_rootfs_labels++], sizeof(try_rootfs_labels[0]), "%s%d", profile_rootfs_label_prefix, slot);
 	if (slot == 1)
-		sprintf(try_rootfs_labels[n_rootfs_labels++], "linuxrootfs");
+		snprintf(try_rootfs_labels[n_rootfs_labels++], sizeof(try_rootfs_labels[0]), "%s", profile_rootfs_label_prefix);
 	sprintf(try_rootfs_labels[n_rootfs_labels++], "rootfs%d", slot);
 
 	while ((entry = readdir(dir)) != NULL)
@@ -2150,7 +2275,7 @@ int detect_via_partlabel(void)
 				{
 					strcpy(rootfs_label, entry->d_name);
 					found_root = 1;
-					if (strcmp(entry->d_name, "userdata") == 0)
+					if (strcmp(entry->d_name, profile_rootfs_shared_label) == 0)
 						use_userdata = 1;
 					break;
 				}
@@ -2333,6 +2458,11 @@ void find_kernel_rootfs_device()
 			my_printf("Profile config: success\n");
 		else
 			my_printf("Profile config: not available or incomplete\n");
+		if (profile_present && profile_ofgwrite_unsupported)
+		{
+			my_printf("Profile config: Ofgwrite disabled for this machine; skipping fallbacks\n");
+			return;
+		}
 	}
 
 	// Priority 3: /dev/disk/by-partlabel/ (deterministic, kernel-maintained)
@@ -2765,6 +2895,11 @@ int main(int argc, char *argv[])
 	{
 		printUsage();
 		return OFG_EXIT_INVALID_INPUT;
+	}
+	if (profile_present && profile_ofgwrite_unsupported)
+	{
+		my_printf("Error: machine profile marks Ofgwrite unsupported\n");
+		return OFG_EXIT_PREFLIGHT_FAIL;
 	}
 
 	// set rootfs type and more

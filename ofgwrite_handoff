@@ -1,0 +1,216 @@
+#!/bin/sh
+set -eu
+
+BACKEND_SCRIPT="${OFGWRITE_BACKEND_SCRIPT:-/usr/libexec/tuxbox/flash-backend-ofgwrite.sh}"
+OFGWRITE_BIN="${OFGWRITE_BIN:-ofgwrite}"
+PROFILE_CONF="${FLASH_MACHINE_PROFILE_PATH:-/etc/tuxbox/flash-machine-profile.conf}"
+
+if [ -f "${PROFILE_CONF}" ]; then
+	# shellcheck disable=SC1091
+	. "${PROFILE_CONF}"
+fi
+
+for procs in \
+	/sys/fs/cgroup/systemd/cgroup.procs \
+	/sys/fs/cgroup/unified/cgroup.procs \
+	/sys/fs/cgroup/cgroup.procs; do
+	[ -w "${procs}" ] || continue
+	echo $$ > "${procs}" 2>/dev/null || true
+done
+
+usage() {
+	cat <<'EOF'
+Usage: ofgwrite_handoff --slot N (--archive FILE | --image-dir DIR) [options]
+
+Options:
+  --allow-active-slot   allow flashing the currently running slot
+  --force               pass force mode to the backend/ofgwrite
+  --machine-progress    request machine-readable progress from ofgwrite
+  --help                show this help
+EOF
+}
+
+fail() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+has_kernel_file() {
+	dir="$1"
+	if [ -n "${FLASH_KERNEL_FILE:-}" ] && [ -f "${dir}/${FLASH_KERNEL_FILE}" ]; then
+		return 0
+	fi
+	[ -f "${dir}/kernel.bin" ] || [ -f "${dir}/uImage" ] || ls "${dir}"/*kernel*.bin >/dev/null 2>&1
+}
+
+has_rootfs_file() {
+	dir="$1"
+	if [ -n "${FLASH_ROOTFS_FILE:-}" ] && [ -f "${dir}/${FLASH_ROOTFS_FILE}" ]; then
+		return 0
+	fi
+	for name in \
+		rootfs.bin \
+		root_cfe_auto.bin \
+		root_cfe_auto.jffs2 \
+		oe_rootfs.bin \
+		e2jffs2.img \
+		rootfs.tar.bz2 \
+		rootfs.ubi \
+		rootfs.tar.xz \
+		rootfs-one.tar.bz2 \
+		rootfs-two.tar.bz2; do
+		[ -f "${dir}/${name}" ] && return 0
+	done
+	ls "${dir}"/*.nfi >/dev/null 2>&1 && return 0
+	ls "${dir}"/*.tar.xz >/dev/null 2>&1 && return 0
+	return 1
+}
+
+find_image_dir() {
+	base="$1"
+	if has_kernel_file "${base}" && has_rootfs_file "${base}"; then
+		echo "${base}"
+		return 0
+	fi
+
+	find "${base}" -mindepth 1 -maxdepth 3 -type d 2>/dev/null | while IFS= read -r d; do
+		if has_kernel_file "${d}" && has_rootfs_file "${d}"; then
+			echo "${d}"
+			exit 0
+		fi
+	done
+}
+
+extract_package() {
+	pkg="$1"
+	dst="$2"
+
+	case "${pkg}" in
+		*.zip)
+			command -v unzip >/dev/null 2>&1 || fail "unzip is required for ${pkg}"
+			unzip -oq "${pkg}" -x '*disk.img*' -d "${dst}" || fail "unzip failed: ${pkg}"
+			;;
+		*.tgz|*.tar.gz)
+			tar -xzf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*.tar.bz2)
+			tar -xjf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*.tar.xz)
+			tar -xJf "${pkg}" --exclude='*disk.img*' -C "${dst}" || fail "tar extract failed: ${pkg}"
+			;;
+		*)
+			fail "unsupported package format: ${pkg}"
+			;;
+	esac
+}
+
+slot=""
+archive=""
+image_dir=""
+force="0"
+allow_active="0"
+machine_progress="0"
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--slot)
+			[ "$#" -ge 2 ] || fail "missing value for --slot"
+			slot="$2"
+			shift 2
+			;;
+		--archive)
+			[ "$#" -ge 2 ] || fail "missing value for --archive"
+			archive="$2"
+			shift 2
+			;;
+		--image-dir)
+			[ "$#" -ge 2 ] || fail "missing value for --image-dir"
+			image_dir="$2"
+			shift 2
+			;;
+		--force)
+			force="1"
+			shift
+			;;
+		--allow-active-slot)
+			allow_active="1"
+			shift
+			;;
+		--machine-progress)
+			machine_progress="1"
+			shift
+			;;
+		--help|-h)
+			usage
+			exit 0
+			;;
+		*)
+			fail "unknown argument: $1"
+			;;
+	esac
+done
+
+case "${slot}" in
+	*[!0-9]*|'')
+		fail "--slot requires a positive integer"
+		;;
+esac
+[ "${slot}" -ge 1 ] || fail "--slot requires a positive integer"
+
+if [ -n "${archive}" ] && [ -n "${image_dir}" ]; then
+	fail "use either --archive or --image-dir, not both"
+fi
+if [ -z "${archive}" ] && [ -z "${image_dir}" ]; then
+	fail "missing --archive or --image-dir"
+fi
+
+cleanup_enabled="0"
+workdir=""
+cleanup() {
+	[ "${cleanup_enabled}" = "1" ] || return 0
+	rm -rf "${workdir}"
+}
+trap cleanup EXIT INT TERM
+
+if [ -n "${archive}" ]; then
+	[ -f "${archive}" ] || fail "archive not found: ${archive}"
+	work_base="${archive%/*}"
+	[ "${work_base}" != "${archive}" ] || work_base="/tmp"
+	[ -d "${work_base}" ] && [ -w "${work_base}" ] || work_base="/tmp"
+	workdir="$(mktemp -d "${work_base%/}/ofgwrite-handoff-XXXXXX")"
+	cleanup_enabled="1"
+	extract_package "${archive}" "${workdir}"
+	image_dir="$(find_image_dir "${workdir}" || true)"
+	[ -n "${image_dir}" ] || fail "could not detect kernel/rootfs payload in extracted update package"
+fi
+
+[ -d "${image_dir}" ] || fail "image directory not found: ${image_dir}"
+[ -x "${BACKEND_SCRIPT}" ] || fail "backend script not executable: ${BACKEND_SCRIPT}"
+
+if [ "${allow_active}" = "1" ]; then
+	export FLASH_ALLOW_ACTIVE_SLOT=1
+fi
+if [ "${machine_progress}" = "1" ]; then
+	if [ -n "${FLASH_OFGWRITE_EXTRA_ARGS:-}" ]; then
+		FLASH_OFGWRITE_EXTRA_ARGS="${FLASH_OFGWRITE_EXTRA_ARGS} --machine-progress"
+	else
+		FLASH_OFGWRITE_EXTRA_ARGS="--machine-progress"
+	fi
+	export FLASH_OFGWRITE_EXTRA_ARGS
+fi
+export OFGWRITE_BIN
+
+set +e
+if [ "${force}" = "1" ]; then
+	"${BACKEND_SCRIPT}" "${slot}" "${image_dir}" force
+else
+	"${BACKEND_SCRIPT}" "${slot}" "${image_dir}"
+fi
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ] && [ -n "${workdir}" ]; then
+	cleanup_enabled="0"
+	printf '%s\n' "Preserving extracted payload in ${workdir} while flash continues" >&2
+fi
+exit "${rc}"
