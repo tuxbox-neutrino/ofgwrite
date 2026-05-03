@@ -49,6 +49,12 @@ void emit_machine_progress(int step, int total_steps, int percent,
 {
 	if (!machine_progress)
 		return;
+	if (total_steps < 1)
+		total_steps = 1;
+	if (step < 1)
+		step = 1;
+	if (step > total_steps)
+		step = total_steps;
 	if (percent < 0)
 		percent = 0;
 	if (percent > 100)
@@ -58,8 +64,6 @@ void emit_machine_progress(int step, int total_steps, int percent,
 		return;
 	g_last_emit_step = step;
 	g_last_emit_percent = percent;
-	if (total_steps < 1)
-		total_steps = 1;
 	fprintf(stderr, "PROGRESS step=%d/%d percent=%d stage=%s\n",
 	        step, total_steps, percent,
 	        (stage && *stage) ? stage : "-");

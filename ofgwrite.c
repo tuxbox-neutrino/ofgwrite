@@ -2722,6 +2722,9 @@ int inject_marker(const char *marker_json, const char *target_rootfs)
 {
 	char dest_dir[1100];
 	char dest[1200];
+	char fallback_dir[1100];
+	char fallback[1200];
+	const char *base;
 	struct stat st;
 
 	if (stat(marker_json, &st) != 0)
@@ -2734,6 +2737,11 @@ int inject_marker(const char *marker_json, const char *target_rootfs)
 	bb_make_directory(dest_dir, -1, FILEUTILS_RECUR);
 
 	snprintf(dest, sizeof(dest), "%s/flash-restore-pending.conf", dest_dir);
+	snprintf(fallback_dir, sizeof(fallback_dir), "%s/var/lib/neutrino-backups", target_rootfs);
+	bb_make_directory(fallback_dir, -1, FILEUTILS_RECUR);
+	base = strrchr(marker_json, '/');
+	base = (base != NULL) ? base + 1 : marker_json;
+	snprintf(fallback, sizeof(fallback), "%s/%s", fallback_dir, base);
 
 	FILE *src = fopen(marker_json, "rb");
 	if (!src)
@@ -2769,6 +2777,37 @@ int inject_marker(const char *marker_json, const char *target_rootfs)
 	}
 
 	my_printf("inject-marker: %s -> %s\n", marker_json, dest);
+	src = fopen(marker_json, "rb");
+	if (!src)
+	{
+		my_printf("inject-marker: cannot reopen %s: %s\n", marker_json, strerror(errno));
+		return 0;
+	}
+	dst = fopen(fallback, "wb");
+	if (!dst)
+	{
+		my_printf("inject-marker: cannot create fallback %s: %s\n", fallback, strerror(errno));
+		fclose(src);
+		return 0;
+	}
+	while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+	{
+		if (fwrite(buf, 1, n, dst) != n)
+		{
+			my_printf("inject-marker: write error to fallback %s: %s\n", fallback, strerror(errno));
+			fclose(src);
+			fclose(dst);
+			return 0;
+		}
+	}
+	fclose(src);
+	if (fclose(dst) != 0)
+	{
+		my_printf("inject-marker: close error on fallback %s: %s\n", fallback, strerror(errno));
+		return 0;
+	}
+
+	my_printf("inject-marker: %s -> %s\n", marker_json, fallback);
 	return 1;
 }
 
