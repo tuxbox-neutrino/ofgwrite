@@ -103,6 +103,8 @@ static char profile_active_slot_source[256] = "";
 int allow_active_slot = 0;
 char inject_backup_path[1000] = "";
 char inject_marker_path[1000] = "";
+char inject_restore_helper_path[1000] = "";
+char inject_restore_service_path[1000] = "";
 int keep_last_n = -1;  /* -1 = disabled */
 int machine_progress = 0;
 
@@ -655,6 +657,8 @@ void printUsage()
 	my_printf("   --target-slot=N        target slot number (alias for -mN)\n");
 	my_printf("   --inject-backup=PATH   copy backup tarball into target rootfs\n");
 	my_printf("   --inject-marker=PATH   copy restore marker JSON into target rootfs\n");
+	my_printf("   --inject-restore-helper=PATH copy first-boot restore helper into target rootfs\n");
+	my_printf("   --inject-restore-service=PATH copy first-boot restore service into target rootfs\n");
 	my_printf("   --keep-last=N          keep at most N backups in target rootfs\n");
 	my_printf("   --machine-progress     emit machine-readable progress on stderr\n");
 }
@@ -797,7 +801,8 @@ int read_args(int argc, char *argv[])
 	long val;
 	static const char *short_options = "ac::k::r::ns:m:pfqh";
 	enum { OPT_ALLOW_ACTIVE = 256, OPT_TARGET_SLOT, OPT_INJECT_BACKUP,
-	       OPT_INJECT_MARKER, OPT_KEEP_LAST, OPT_MACHINE_PROGRESS };
+	       OPT_INJECT_MARKER, OPT_INJECT_RESTORE_HELPER,
+	       OPT_INJECT_RESTORE_SERVICE, OPT_KEEP_LAST, OPT_MACHINE_PROGRESS };
 	static const struct option long_options[] = {
 												{"android"          , no_argument      , NULL, 'a'},
 												{"currentslot"      , optional_argument, NULL, 'c'},
@@ -814,6 +819,8 @@ int read_args(int argc, char *argv[])
 												{"target-slot"      , required_argument, NULL, OPT_TARGET_SLOT},
 												{"inject-backup"    , required_argument, NULL, OPT_INJECT_BACKUP},
 												{"inject-marker"    , required_argument, NULL, OPT_INJECT_MARKER},
+												{"inject-restore-helper", required_argument, NULL, OPT_INJECT_RESTORE_HELPER},
+												{"inject-restore-service", required_argument, NULL, OPT_INJECT_RESTORE_SERVICE},
 												{"keep-last"        , required_argument, NULL, OPT_KEEP_LAST},
 												{"machine-progress" , no_argument      , NULL, OPT_MACHINE_PROGRESS},
 												{NULL               , no_argument      , NULL,  0} };
@@ -946,6 +953,20 @@ int read_args(int argc, char *argv[])
 				{
 					strncpy(inject_marker_path, optarg, sizeof(inject_marker_path) - 1);
 					my_printf("Inject marker: %s\n", inject_marker_path);
+				}
+				break;
+			case OPT_INJECT_RESTORE_HELPER:
+				if (optarg)
+				{
+					strncpy(inject_restore_helper_path, optarg, sizeof(inject_restore_helper_path) - 1);
+					my_printf("Inject restore helper: %s\n", inject_restore_helper_path);
+				}
+				break;
+			case OPT_INJECT_RESTORE_SERVICE:
+				if (optarg)
+				{
+					strncpy(inject_restore_service_path, optarg, sizeof(inject_restore_service_path) - 1);
+					my_printf("Inject restore service: %s\n", inject_restore_service_path);
 				}
 				break;
 			case OPT_KEEP_LAST:
@@ -2647,6 +2668,57 @@ int check_device_size()
 	return 1;
 }
 
+static int copy_file_to_path(const char *src_path, const char *dest_path,
+			     const char *label)
+{
+	FILE *src;
+	FILE *dst;
+	char buf[65536];
+	size_t n;
+	struct stat st;
+
+	if (stat(src_path, &st) != 0)
+	{
+		my_printf("%s: source %s not found\n", label, src_path);
+		return 0;
+	}
+
+	src = fopen(src_path, "rb");
+	if (!src)
+	{
+		my_printf("%s: cannot open %s: %s\n", label, src_path, strerror(errno));
+		return 0;
+	}
+	dst = fopen(dest_path, "wb");
+	if (!dst)
+	{
+		my_printf("%s: cannot create %s: %s\n", label, dest_path, strerror(errno));
+		fclose(src);
+		return 0;
+	}
+
+	while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+	{
+		if (fwrite(buf, 1, n, dst) != n)
+		{
+			my_printf("%s: write error to %s: %s\n", label, dest_path, strerror(errno));
+			fclose(src);
+			fclose(dst);
+			return 0;
+		}
+	}
+	fclose(src);
+	if (fclose(dst) != 0)
+	{
+		my_printf("%s: close error on %s: %s\n", label, dest_path, strerror(errno));
+		return 0;
+	}
+	chmod(dest_path, st.st_mode & 0777);
+	my_printf("%s: %s -> %s (%lld bytes)\n", label, src_path, dest_path,
+		(long long)st.st_size);
+	return 1;
+}
+
 /* Copy a backup tarball into the target rootfs.
  * target_rootfs is the mount point (e.g. "/oldroot_remount" or
  * "/oldroot_remount/linuxrootfs3").
@@ -2712,6 +2784,52 @@ int inject_backup(const char *tarball, const char *target_rootfs)
 	}
 
 	my_printf("inject-backup: %s -> %s (%lld bytes)\n", tarball, dest, (long long)st.st_size);
+	return 1;
+}
+
+/* Copy the first-boot restore runtime into the target rootfs. This keeps
+ * restore behavior stable even when an older image is being flashed.
+ */
+int inject_restore_runtime(const char *helper, const char *service,
+			   const char *target_rootfs)
+{
+	char dest_dir[1100];
+	char dest[1200];
+	char wants_dir[1200];
+	char wants_link[1300];
+
+	if (helper != NULL && helper[0] != '\0')
+	{
+		snprintf(dest_dir, sizeof(dest_dir), "%s/usr/libexec/tuxbox", target_rootfs);
+		bb_make_directory(dest_dir, -1, FILEUTILS_RECUR);
+		snprintf(dest, sizeof(dest), "%s/tuxbox-flash-restore.sh", dest_dir);
+		if (!copy_file_to_path(helper, dest, "inject-restore-helper"))
+			return 0;
+	}
+
+	if (service != NULL && service[0] != '\0')
+	{
+		snprintf(dest_dir, sizeof(dest_dir), "%s/lib/systemd/system", target_rootfs);
+		bb_make_directory(dest_dir, -1, FILEUTILS_RECUR);
+		snprintf(dest, sizeof(dest), "%s/tuxbox-flash-restore.service", dest_dir);
+		if (!copy_file_to_path(service, dest, "inject-restore-service"))
+			return 0;
+
+		snprintf(wants_dir, sizeof(wants_dir),
+			"%s/etc/systemd/system/multi-user.target.wants", target_rootfs);
+		bb_make_directory(wants_dir, -1, FILEUTILS_RECUR);
+		snprintf(wants_link, sizeof(wants_link),
+			"%s/tuxbox-flash-restore.service", wants_dir);
+		unlink(wants_link);
+		if (symlink("/lib/systemd/system/tuxbox-flash-restore.service", wants_link) != 0)
+		{
+			my_printf("inject-restore-service: cannot enable %s: %s\n",
+				wants_link, strerror(errno));
+			return 0;
+		}
+		my_printf("inject-restore-service: enabled %s\n", wants_link);
+	}
+
 	return 1;
 }
 
@@ -3165,6 +3283,8 @@ int main(int argc, char *argv[])
 		 */
 		if (!no_write && (inject_backup_path[0] != '\0'
 				|| inject_marker_path[0] != '\0'
+				|| inject_restore_helper_path[0] != '\0'
+				|| inject_restore_service_path[0] != '\0'
 				|| keep_last_n >= 0))
 		{
 			char inject_root[1100];
@@ -3180,6 +3300,19 @@ int main(int argc, char *argv[])
 				{
 					my_printf("Error: backup injection failed\n");
 					set_error_text1("Error injecting backup into target rootfs");
+					sleep(3);
+					close_framebuffer();
+					return OFG_EXIT_WRITE_FAILURE;
+				}
+			}
+			if (inject_restore_helper_path[0] != '\0'
+				|| inject_restore_service_path[0] != '\0')
+			{
+				if (!inject_restore_runtime(inject_restore_helper_path,
+						inject_restore_service_path, inject_root))
+				{
+					my_printf("Error: restore runtime injection failed\n");
+					set_error_text1("Error injecting restore runtime");
 					sleep(3);
 					close_framebuffer();
 					return OFG_EXIT_WRITE_FAILURE;

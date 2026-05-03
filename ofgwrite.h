@@ -85,6 +85,8 @@ extern char profile_conf_path[1000];
 
 /* Pre-flash injection into target rootfs */
 int inject_backup(const char *tarball, const char *target_rootfs);
+int inject_restore_runtime(const char *helper, const char *service,
+			   const char *target_rootfs);
 int inject_marker(const char *marker_json, const char *target_rootfs);
 int apply_keep_last(int keep_n, const char *target_rootfs);
 
@@ -92,6 +94,8 @@ int apply_keep_last(int keep_n, const char *target_rootfs);
 extern int allow_active_slot;
 extern char inject_backup_path[1000];
 extern char inject_marker_path[1000];
+extern char inject_restore_helper_path[1000];
+extern char inject_restore_service_path[1000];
 extern int keep_last_n;
 extern int machine_progress;
 
@@ -120,4 +124,3 @@ int ubiattach_main(int argc, char **argv);
 int flashcp_main(int argc, char **argv);
 int cp_main(int argc, char **argv);
 int losetup_main(int argc, char **argv);
-
