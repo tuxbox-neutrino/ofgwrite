@@ -190,6 +190,8 @@ fi
 
 if [ "${allow_active}" = "1" ]; then
 	export FLASH_ALLOW_ACTIVE_SLOT=1
+elif [ -z "${FLASH_STOP_NEUTRINO_BEFORE_FLASH:-}" ]; then
+	export FLASH_STOP_NEUTRINO_BEFORE_FLASH=0
 fi
 if [ "${machine_progress}" = "1" ]; then
 	if [ -n "${FLASH_OFGWRITE_EXTRA_ARGS:-}" ]; then
