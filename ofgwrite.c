@@ -134,7 +134,7 @@ enum RootfsTypeEnum rootfs_type;
 int stop_e2_needed = 1;
 int chkroot_mode = 0;
 
-const char ofgwrite_version[] = "4.8.0.27";
+const char ofgwrite_version[] = "4.8.0.28";
 
 struct struct_mountlist
 {
@@ -2125,6 +2125,190 @@ static int parse_dev_partition_nr(const char* dev, int* prefix_len)
 	return atoi(dev + i + 1);
 }
 
+static void strip_token_quotes(char *value)
+{
+	size_t len;
+
+	while (value[0] == '\'' || value[0] == '"')
+		memmove(value, value + 1, strlen(value));
+
+	len = strlen(value);
+	while (len > 0 && (value[len - 1] == '\'' || value[len - 1] == '"'))
+		value[--len] = '\0';
+}
+
+static int token_value_from_text(const char *text, const char *key,
+	char *dest, size_t dest_size)
+{
+	char token[512];
+	const char *p = text;
+	size_t key_len = strlen(key);
+
+	if (dest_size == 0)
+		return 0;
+	dest[0] = '\0';
+
+	while (*p != '\0')
+	{
+		size_t i = 0;
+
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			p++;
+		if (*p == '\0')
+			break;
+		while (*p != '\0' && *p != ' ' && *p != '\t'
+			&& *p != '\r' && *p != '\n' && i < sizeof(token) - 1)
+			token[i++] = *p++;
+		token[i] = '\0';
+		strip_token_quotes(token);
+
+		if (strncmp(token, key, key_len) == 0 && token[key_len] == '=')
+		{
+			copy_string(dest, dest_size, token + key_len + 1);
+			strip_token_quotes(dest);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void normalize_dev_token(char *dest, size_t dest_size, const char *value)
+{
+	if (value == NULL || value[0] == '\0')
+	{
+		if (dest_size > 0)
+			dest[0] = '\0';
+		return;
+	}
+
+	if (strncmp(value, "/dev/", 5) == 0)
+		copy_string(dest, dest_size, value);
+	else
+		snprintf(dest, dest_size, "/dev/%s", value);
+}
+
+static int read_startup_file(const char *path, char *text, size_t text_size)
+{
+	FILE *f;
+	size_t n;
+
+	if (text_size == 0)
+		return 0;
+	text[0] = '\0';
+
+	f = fopen(path, "r");
+	if (f == NULL)
+		return 0;
+
+	n = fread(text, 1, text_size - 1, f);
+	text[n] = '\0';
+	fclose(f);
+	return n > 0;
+}
+
+static int rootsubdir_slot_matches(const char *rootsubdir, int slot)
+{
+	char expected[128];
+
+	if (rootsubdir[0] == '\0')
+		return 1;
+
+	snprintf(expected, sizeof(expected), "%s%d", slotname, slot);
+	return strcmp(rootsubdir, expected) == 0;
+}
+
+static int startup_file_for_slot(int slot, char *path, size_t path_size,
+	char *text, size_t text_size)
+{
+	const char *env_boot_dir = getenv("FLASH_BOOT_DIR_PATH");
+	const char *dirs[4];
+	const char *names[] = {
+		"STARTUP_LINUX_%d_BOXMODE_1",
+		"STARTUP_LINUX_%d_BOXMODE_12",
+		"STARTUP_%d",
+		"STARTUP"
+	};
+	int dir_count = 0;
+
+	if (env_boot_dir != NULL && env_boot_dir[0] != '\0')
+		dirs[dir_count++] = env_boot_dir;
+	dirs[dir_count++] = "/media/boot-mmcblk0p1";
+	dirs[dir_count++] = "/boot";
+	dirs[dir_count++] = "/media/boot";
+
+	for (int d = 0; d < dir_count; d++)
+	{
+		for (int n = 0; n < (int)(sizeof(names) / sizeof(names[0])); n++)
+		{
+			char candidate[512];
+			char name[128];
+			char rootsubdir[256] = "";
+
+			if (strstr(names[n], "%d") != NULL)
+				snprintf(name, sizeof(name), names[n], slot);
+			else
+				copy_string(name, sizeof(name), names[n]);
+			snprintf(candidate, sizeof(candidate), "%s/%s", dirs[d], name);
+
+			if (!read_startup_file(candidate, text, text_size))
+				continue;
+
+			if (strcmp(names[n], "STARTUP") == 0)
+			{
+				token_value_from_text(text, "rootsubdir",
+					rootsubdir, sizeof(rootsubdir));
+				if (!rootsubdir_slot_matches(rootsubdir, slot))
+					continue;
+			}
+
+			copy_string(path, path_size, candidate);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int detect_startup_devices_for_slot(int slot, char *startup_path,
+	size_t startup_path_size, char *startup_kernel, size_t startup_kernel_size,
+	char *startup_rootfs, size_t startup_rootfs_size,
+	char *startup_rootsubdir, size_t startup_rootsubdir_size)
+{
+	char text[4096];
+	char kernel_token[256] = "";
+	char root_token[256] = "";
+
+	startup_path[0] = '\0';
+	startup_kernel[0] = '\0';
+	startup_rootfs[0] = '\0';
+	startup_rootsubdir[0] = '\0';
+
+	if (!startup_file_for_slot(slot, startup_path, startup_path_size,
+		text, sizeof(text)))
+		return 0;
+
+	token_value_from_text(text, "kernel", kernel_token, sizeof(kernel_token));
+	token_value_from_text(text, "root", root_token, sizeof(root_token));
+	token_value_from_text(text, "rootsubdir", startup_rootsubdir,
+		startup_rootsubdir_size);
+
+	if (!rootsubdir_slot_matches(startup_rootsubdir, slot))
+	{
+		my_printf("Profile config: target slot %d STARTUP %s has unexpected rootsubdir=%s\n",
+			slot, startup_path, startup_rootsubdir);
+		return -1;
+	}
+
+	if (kernel_token[0] != '\0')
+		normalize_dev_token(startup_kernel, startup_kernel_size, kernel_token);
+	if (root_token[0] != '\0')
+		normalize_dev_token(startup_rootfs, startup_rootfs_size, root_token);
+
+	return startup_kernel[0] != '\0' || startup_rootfs[0] != '\0'
+		|| startup_rootsubdir[0] != '\0';
+}
+
 /* Detect kernel and rootfs devices from flash-machine-profile.conf.
  * The config file is generated at build time by the Yocto flash-script recipe
  * and provides deterministic device paths per machine.
@@ -2134,6 +2318,11 @@ static int parse_dev_partition_nr(const char* dev, int* prefix_len)
 int detect_via_profile_conf(void)
 {
 	int slot;
+	int startup_status;
+	char startup_path[512] = "";
+	char startup_kernel[256] = "";
+	char startup_rootfs[256] = "";
+	char startup_rootsubdir[256] = "";
 
 	load_profile_conf();
 
@@ -2172,7 +2361,24 @@ int detect_via_profile_conf(void)
 
 	// Resolve kernel device with multiboot offset
 	slot = (multiboot_partition > 0) ? multiboot_partition : 1;
-	if (kernel_flash_mode == TARBZ2 && slot > 1)
+	startup_status = detect_startup_devices_for_slot(slot, startup_path,
+		sizeof(startup_path), startup_kernel, sizeof(startup_kernel),
+		startup_rootfs, sizeof(startup_rootfs), startup_rootsubdir,
+		sizeof(startup_rootsubdir));
+	if (startup_status < 0)
+		return 0;
+	if (startup_status > 0)
+		my_printf("Profile config: STARTUP source %s kernel=%s rootfs=%s rootsubdir=%s\n",
+			startup_path,
+			startup_kernel[0] != '\0' ? startup_kernel : "(profile)",
+			startup_rootfs[0] != '\0' ? startup_rootfs : "(profile)",
+			startup_rootsubdir[0] != '\0' ? startup_rootsubdir : "(profile)");
+
+	if (startup_kernel[0] != '\0')
+	{
+		copy_string(kernel_device, sizeof(kernel_device), startup_kernel);
+	}
+	else if (kernel_flash_mode == TARBZ2 && slot > 1)
 	{
 		// eMMC multiboot: kernel partitions are sequential
 		// e.g. slot1=mmcblk0p19, slot2=mmcblk0p20, ...
@@ -2181,9 +2387,17 @@ int detect_via_profile_conf(void)
 		if (base_nr >= 0)
 		{
 			int target_nr = base_nr + (slot - 1);
+			int rootfs_prefix_len = 0;
+			int rootfs_base_nr = parse_dev_partition_nr(profile_rootfs_device,
+				&rootfs_prefix_len);
 			char dev_base[256];
 			strncpy(dev_base, profile_kernel_device, prefix_len);
 			dev_base[prefix_len] = '\0';
+			if (slot > 1 && rootfs_base_nr == base_nr + 1
+				&& rootfs_prefix_len == prefix_len
+				&& strncmp(profile_rootfs_device, profile_kernel_device,
+					prefix_len) == 0)
+				target_nr++;
 			sprintf(kernel_device, "/dev/%s%d", dev_base, target_nr);
 		}
 		else
@@ -2196,11 +2410,18 @@ int detect_via_profile_conf(void)
 		sprintf(kernel_device, "/dev/%s", profile_kernel_device);
 	}
 
-	// Rootfs device (stays the same for all slots on userdata partition)
-	sprintf(rootfs_device, "/dev/%s", profile_rootfs_device);
+	if (startup_rootfs[0] != '\0')
+		copy_string(rootfs_device, sizeof(rootfs_device), startup_rootfs);
+	else
+		sprintf(rootfs_device, "/dev/%s", profile_rootfs_device);
 
 	// Set rootfs subdirectory for multiboot
-	if ((current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
+	if (startup_rootsubdir[0] != '\0' && rootsubdir_check == 0)
+	{
+		copy_string(rootfs_sub_dir, sizeof(rootfs_sub_dir),
+			startup_rootsubdir);
+	}
+	else if ((current_rootfs_sub_dir[0] != '\0' || multiboot_partition > 0)
 		&& rootsubdir_check == 0)
 	{
 		sprintf(rootfs_sub_dir, "%s%d", slotname, slot);
@@ -3101,6 +3322,20 @@ int main(int argc, char *argv[])
 
 	if (!check_device_size())
 		return OFG_EXIT_PREFLIGHT_FAIL;
+
+	if (no_write)
+	{
+		my_printf("No-write mode: resolved kernel=%s rootfs=%s sub_dir=%s; skipping all flash writes\n",
+			found_kernel_device ? kernel_device : "(none)",
+			found_rootfs_device ? rootfs_device : "(none)",
+			rootfs_sub_dir);
+		if (machine_progress)
+		{
+			fprintf(stderr, "PROGRESS done\n");
+			fflush(stderr);
+		}
+		return OFG_EXIT_SUCCESS;
+	}
 
 	my_printf("\n");
 

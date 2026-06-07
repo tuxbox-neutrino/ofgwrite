@@ -15,6 +15,7 @@ cleanup_newroot
 mkdir -p /newroot
 mount -t tmpfs tmpfs /newroot
 ln -sfn / /newroot/newroot
+dry_run=0
 
 stage_inject_arg() {
 	arg="$1"
@@ -46,6 +47,9 @@ while [ "${argc}" -gt 0 ]; do
 	argc=$((argc - 1))
 
 	case "${arg}" in
+		-n|--nowrite)
+			dry_run=1
+			;;
 		--inject-backup=*|--inject-marker=*|--inject-restore-helper=*|--inject-restore-service=*)
 			arg="$(stage_inject_arg "${arg}")"
 			;;
@@ -68,6 +72,6 @@ rc=$?
 
 # Only clean up /newroot if ofgwrite_bin failed. Exit 0 means the process
 # daemonized successfully and the flash is still running in the background.
-if [ "$rc" -ne 0 ]; then
+if [ "$rc" -ne 0 ] || [ "${dry_run}" = "1" ]; then
 	cleanup_newroot
 fi
