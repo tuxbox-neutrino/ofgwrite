@@ -107,6 +107,7 @@ char inject_restore_helper_path[1000] = "";
 char inject_restore_service_path[1000] = "";
 int keep_last_n = -1;  /* -1 = disabled */
 int machine_progress = 0;
+int no_framebuffer = 0;
 
 enum FlashModeTypeEnum kernel_flash_mode;
 enum FlashModeTypeEnum rootfs_flash_mode;
@@ -661,6 +662,7 @@ void printUsage()
 	my_printf("   --inject-restore-service=PATH copy first-boot restore service into target rootfs\n");
 	my_printf("   --keep-last=N          keep at most N backups in target rootfs\n");
 	my_printf("   --machine-progress     emit machine-readable progress on stderr\n");
+	my_printf("   --no-framebuffer       do not draw on framebuffer\n");
 }
 
 char* ReadProcEntry(char *filename)
@@ -802,7 +804,8 @@ int read_args(int argc, char *argv[])
 	static const char *short_options = "ac::k::r::ns:m:pfqh";
 	enum { OPT_ALLOW_ACTIVE = 256, OPT_TARGET_SLOT, OPT_INJECT_BACKUP,
 	       OPT_INJECT_MARKER, OPT_INJECT_RESTORE_HELPER,
-	       OPT_INJECT_RESTORE_SERVICE, OPT_KEEP_LAST, OPT_MACHINE_PROGRESS };
+	       OPT_INJECT_RESTORE_SERVICE, OPT_KEEP_LAST, OPT_MACHINE_PROGRESS,
+	       OPT_NO_FRAMEBUFFER };
 	static const struct option long_options[] = {
 												{"android"          , no_argument      , NULL, 'a'},
 												{"currentslot"      , optional_argument, NULL, 'c'},
@@ -823,6 +826,7 @@ int read_args(int argc, char *argv[])
 												{"inject-restore-service", required_argument, NULL, OPT_INJECT_RESTORE_SERVICE},
 												{"keep-last"        , required_argument, NULL, OPT_KEEP_LAST},
 												{"machine-progress" , no_argument      , NULL, OPT_MACHINE_PROGRESS},
+												{"no-framebuffer"   , no_argument      , NULL, OPT_NO_FRAMEBUFFER},
 												{NULL               , no_argument      , NULL,  0} };
 
 	strcpy(slotname, "linuxrootfs");
@@ -986,6 +990,9 @@ int read_args(int argc, char *argv[])
 				break;
 			case OPT_MACHINE_PROGRESS:
 				machine_progress = 1;
+				break;
+			case OPT_NO_FRAMEBUFFER:
+				no_framebuffer = 1;
 				break;
 			case '?':
 				show_help = 1;
@@ -1837,9 +1844,14 @@ int umount_rootfs(int steps)
 	// some boxes don't allow to open framebuffer while e2 is running
 	// reopen framebuffer to show the GUI
 	close_framebuffer();
-	init_framebuffer(steps);
-	show_main_window(1, ofgwrite_version);
-	set_overall_text("Flashing image");
+	if (no_framebuffer)
+		init_progress_tracking(steps);
+	else
+	{
+		init_framebuffer(steps);
+		show_main_window(1, ofgwrite_version);
+		set_overall_text("Flashing image");
+	}
 	set_step_without_incr("Wait until " UI " is stopped");
 	sleep(2);
 
@@ -3345,9 +3357,14 @@ int main(int argc, char *argv[])
 		if (!quiet)
 			my_printf("Flashing kernel ...\n");
 
-		init_framebuffer(2);
-		show_main_window(0, ofgwrite_version);
-		set_overall_text("Flashing kernel");
+		if (no_framebuffer)
+			init_progress_tracking(2);
+		else
+		{
+			init_framebuffer(2);
+			show_main_window(0, ofgwrite_version);
+			set_overall_text("Flashing kernel");
+		}
 
 		if (!kernel_flash(kernel_device, kernel_filename))
 			ret = OFG_EXIT_WRITE_FAILURE;
@@ -3389,9 +3406,14 @@ int main(int argc, char *argv[])
 			steps+= 2;
 		else if (flash_kernel && (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD))
 			steps+= 1;
-		init_framebuffer(steps);
-		show_main_window(0, ofgwrite_version);
-		set_overall_text("Flashing image");
+		if (no_framebuffer)
+			init_progress_tracking(steps);
+		else
+		{
+			init_framebuffer(steps);
+			show_main_window(0, ofgwrite_version);
+			set_overall_text("Flashing image");
+		}
 		set_step("Killing processes");
 
 		// kill nmbd, smbd, rpc.mountd and rpc.statd -> otherwise remounting root read-only is not possible

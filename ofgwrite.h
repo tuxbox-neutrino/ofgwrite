@@ -63,6 +63,7 @@ void set_overall_progress(int step);
 void set_error_text(char* str);
 void set_error_text1(char* str);
 void set_error_text2(char* str);
+void init_progress_tracking(int steps);
 int init_framebuffer(int steps);
 void close_framebuffer();
 void set_overall_text(char* str);
@@ -98,6 +99,7 @@ extern char inject_restore_helper_path[1000];
 extern char inject_restore_service_path[1000];
 extern int keep_last_n;
 extern int machine_progress;
+extern int no_framebuffer;
 
 /* Emit machine-readable progress line on stderr when --machine-progress is
    active. Format: "PROGRESS step=N/M percent=P stage=<name>" */

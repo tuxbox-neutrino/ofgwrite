@@ -100,6 +100,18 @@ struct progressbar g_pb_step;
 
 void paint_box(int x1, int y1, int x2, int y2, char* color);
 
+void init_progress_tracking(int steps)
+{
+	if (steps < 1)
+		steps = 1;
+
+	g_step = 1;
+	g_pb_overall.steps = steps;
+	g_last_stage[0] = '\0';
+	g_last_emit_percent = -1;
+	g_last_emit_step = -1;
+}
+
 static int get_safe_pages(void)
 {
 	if (!g_fbMapLen || !g_screeninfo_fix.line_length || !g_screeninfo_var.yres)
@@ -177,6 +189,8 @@ void paint_box(int x1, int y1, int x2, int y2, char* color)
 
 void init_progressbars(int steps)
 {
+	init_progress_tracking(steps);
+
 	// overall progressbar
 	g_pb_overall.width = g_window.width * 0.8;
 	g_pb_overall.height = g_window.height * 0.1;
@@ -186,7 +200,6 @@ void init_progressbars(int steps)
 	g_pb_overall.y1 = g_window.y1 + g_window.height * 0.4;
 	g_pb_overall.x2 = g_window.x2 - (g_window.width * 0.2 / 2 - g_pb_overall.outer_border_width - g_pb_overall.inner_border_width);
 	g_pb_overall.y2 = g_pb_overall.y1 + g_pb_overall.height + 2 * g_pb_overall.outer_border_width + 2* g_pb_overall.inner_border_width;
-	g_pb_overall.steps = steps;
 
 	g_pb_step.width = g_window.width * 0.8;
 	g_pb_step.height = g_window.height * 0.1;
