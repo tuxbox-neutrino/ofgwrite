@@ -2226,6 +2226,7 @@ static int startup_file_for_slot(int slot, char *path, size_t path_size,
 	const char *names[] = {
 		"STARTUP_LINUX_%d_BOXMODE_1",
 		"STARTUP_LINUX_%d_BOXMODE_12",
+		"STARTUP_LINUX_%d",
 		"STARTUP_%d",
 		"STARTUP"
 	};
