@@ -3660,8 +3660,8 @@ int main(int argc, char *argv[])
 					dreamcard = 0;
 				}
 
-				if (strcmp(label, "DREAMCARD\n") != 0) {
-					my_printf("Info: The device label does not match 'dreamcard'\n");
+				if (strcmp(label, "DREAMCARD\n") != 0 && strcmp(label, "DREAMBOOT\n") != 0) {
+					my_printf("Info: The device label does not match 'dreamcard' or 'dreamboot'\n");
 					dreamcard = 0;
 				}
 				if (dreamcard) {
@@ -3673,15 +3673,21 @@ int main(int argc, char *argv[])
 						rmdir(dreamcard_mount);
 						return OFG_EXIT_WRITE_FAILURE;
 					}
-					size_t length = strlen(rootfs_device);
-					int kernelnr = (length > 0) ? rootfs_device[length - 1] - '0' : -1;
-					if (kernelnr < 0 || kernelnr > 9) {
-						my_printf("Error: Invalid kernel number\n");
-						rmdir(dreamcard_mount);
-						return OFG_EXIT_INVALID_INPUT;
-					}
 					char filename[50];
-					snprintf(filename, sizeof(filename), "/dreamcard/kernel%d.img", kernelnr);
+					//SD auto-boot variant: u-boot.bin + kernel.img present -> write kernel.img
+					if (access("/dreamcard/u-boot.bin", F_OK) == 0
+					 && access("/dreamcard/kernel.img", F_OK) == 0) {
+						snprintf(filename, sizeof(filename), "/dreamcard/kernel.img");
+					} else {
+						size_t length = strlen(rootfs_device);
+						int kernelnr = (length > 0) ? rootfs_device[length - 1] - '0' : -1;
+						if (kernelnr < 0 || kernelnr > 9) {
+							my_printf("Error: Invalid kernel number\n");
+							rmdir(dreamcard_mount);
+							return OFG_EXIT_INVALID_INPUT;
+						}
+						snprintf(filename, sizeof(filename), "/dreamcard/kernel%d.img", kernelnr);
+					}
 					my_printf("start generate %s image on %s\n", filename, dreamcard_device);
 					generate_boot_image(filename);
 					sync();
@@ -3700,7 +3706,9 @@ int main(int argc, char *argv[])
 		sleep(1);
 		if (!stop_e2_needed)
 		{
-			ret = umount2("/oldroot_remount/", MNT_DETACH);
+			ret = umount("/oldroot_remount/");	// blocking umount to flush dirty pages before reboot
+			if (ret)
+				umount2("/oldroot_remount/", MNT_DETACH);	// fallback if mountpoint is busy
 			ret = rmdir("/oldroot_remount/");
 			ret = umount2("/newroot/", MNT_DETACH);
 			ret = rmdir("/newroot/");
