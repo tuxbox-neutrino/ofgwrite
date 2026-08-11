@@ -3,6 +3,10 @@ name: Version sync
 on:
   push:
     branches: [master]
+  # Ein neues Tag verschiebt die abgeleitete Version, loest aber keinen
+  # Push aus. Von Hand startbar, damit der String nicht bis zum naechsten
+  # Commit auf dem alten Stand haengenbleibt.
+  workflow_dispatch:
 
 permissions:
   contents: write
