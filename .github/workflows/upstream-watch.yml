@@ -1,0 +1,88 @@
+name: Upstream watch
+
+# Meldet, wenn oe-alliance/ofgwrite Commits hat, die dieser Fork noch nicht
+# enthaelt. Der Rueckstand wird in genau einem Issue mit dem Label
+# "upstream-sync" gefuehrt: neu angelegt, aktualisiert oder geschlossen.
+# Der Abgleich selbst laeuft von Hand -- siehe Skill "fork-upstream-sync".
+
+on:
+  schedule:
+    # Montags 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM_URL: https://github.com/oe-alliance/ofgwrite.git
+      UPSTREAM_BRANCH: master
+      LABEL: upstream-sync
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare against upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+
+          behind=$(git rev-list --count HEAD..upstream/$UPSTREAM_BRANCH)
+          echo "BEHIND=$behind" >> "$GITHUB_ENV"
+          echo "Upstream commits missing in this fork: $behind"
+
+          if [ "$behind" -gt 0 ]; then
+            {
+              echo "Dieser Fork liegt **$behind Commits** hinter"
+              echo "\`oe-alliance/ofgwrite@$UPSTREAM_BRANCH\`."
+              echo
+              echo "Fehlende Commits (aelteste zuerst):"
+              echo
+              git log --reverse --pretty='- `%h` %s _(%an, %ad)_' \
+                --date=short HEAD..upstream/$UPSTREAM_BRANCH
+              echo
+              echo "Abgleich nach Skill \`fork-upstream-sync\`:"
+              echo "Vorschau mit \`git merge-tree\`, dann mergen, Fork-Policy"
+              echo "beim Aufloesen beachten (Sonar-Workflow bleibt geloescht,"
+              echo "Versionsschema 4.8.0.NN, \`OFG_MKDIR_MODE\`, keine"
+              echo "\`EXIT_FAILURE\` statt \`OFG_EXIT_*\`)."
+              echo
+              echo "_Automatisch erzeugt von \`upstream-watch.yml\`._"
+            } > issue-body.md
+          fi
+
+      - name: Open, update or close the tracking issue
+        run: |
+          gh label create "$LABEL" \
+            --description "Fork liegt hinter oe-alliance/ofgwrite" \
+            --color BFD4F2 2>/dev/null || true
+
+          existing=$(gh issue list --label "$LABEL" --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ "$BEHIND" -eq 0 ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" \
+                --body "Rueckstand abgearbeitet: Fork enthaelt den Upstream-Stand vollstaendig. Wird geschlossen."
+              gh issue close "$existing"
+              echo "Issue #$existing geschlossen."
+            else
+              echo "Kein Rueckstand, kein offenes Issue. Nichts zu tun."
+            fi
+            exit 0
+          fi
+
+          title="Upstream ist $BEHIND Commits voraus"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file issue-body.md
+            echo "Issue #$existing aktualisiert."
+          else
+            gh issue create --title "$title" --body-file issue-body.md \
+              --label "$LABEL"
+          fi
