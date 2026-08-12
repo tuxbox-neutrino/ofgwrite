@@ -59,9 +59,14 @@ jobs:
 
       - name: Open, update or close the tracking issue
         run: |
-          gh label create "$LABEL" \
-            --description "Fork liegt hinter oe-alliance/ofgwrite" \
-            --color BFD4F2 2>/dev/null || true
+          # Kein stilles Schlucken: nur der "existiert schon"-Fall ist ok,
+          # jeder andere Fehler (Issues deaktiviert, Token ohne Recht) soll
+          # den Lauf rot machen statt den Melder leise zu entwerten.
+          if ! gh label list --json name --jq '.[].name' | grep -qx "$LABEL"; then
+            gh label create "$LABEL" \
+              --description "Fork liegt hinter oe-alliance/ofgwrite" \
+              --color BFD4F2
+          fi
 
           existing=$(gh issue list --label "$LABEL" --state open \
             --json number --jq '.[0].number // empty')
