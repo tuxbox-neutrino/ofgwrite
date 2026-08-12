@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Pin gh to this repository. After "git remote add upstream" below, gh
+      # would otherwise resolve the default repo from the remotes and talk to
+      # oe-alliance/ofgwrite instead (HTTP 403 on labels/issues).
+      GH_REPO: ${{ github.repository }}
       UPSTREAM_URL: https://github.com/oe-alliance/ofgwrite.git
       UPSTREAM_BRANCH: master
       LABEL: upstream-sync
